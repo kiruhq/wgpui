@@ -6,8 +6,8 @@ use gpui::{
 };
 use gpui_platform::application;
 use gpui_wgpu::{
-    GlobalCustomShaderConfig, ShaderSurfaceDraw, clear_shader_surface_draws,
-    push_shader_surface_draw, register_named_custom_shader,
+    GlobalCustomShaderConfig, RenderPrimitive, ShaderSurfaceDraw, register_named_custom_shader,
+    submit_render_primitive,
 };
 
 const SPINNING_CUBE_SHADER_WGSL: &str = r#"
@@ -151,7 +151,6 @@ struct UiWithShaderApp {
 impl Render for UiWithShaderApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
-        clear_shader_surface_draws();
 
         div()
             .size_full()
@@ -306,11 +305,17 @@ fn cube_shader_surface(enabled: bool) -> impl IntoElement {
             .flat_map(|value| value.to_ne_bytes())
             .collect();
 
-        push_shader_surface_draw(ShaderSurfaceDraw {
-            shader_key: SPINNING_CUBE_SHADER_KEY.to_string(),
-            normalized_bounds: [min_x, min_y, max_x, max_y],
-            uniform_bytes: Some(uniform_bytes),
+        submit_render_primitive(RenderPrimitive {
+            draw: Some(ShaderSurfaceDraw {
+                shader_key: SPINNING_CUBE_SHADER_KEY.to_string(),
+                normalized_bounds: [min_x, min_y, max_x, max_y],
+                uniform_bytes: Some(uniform_bytes),
+                texture_key: None,
+            }),
             texture_key: None,
+            textures_2d: Vec::new(),
+            textures_nv12: Vec::new(),
+            textures_3d: Vec::new(),
         });
     })
     .size_full()

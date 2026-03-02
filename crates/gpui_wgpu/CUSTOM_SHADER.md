@@ -33,8 +33,7 @@ When global mode is configured, `WgpuRenderer::draw(...)` automatically applies 
 Named shader-surface mode:
 - `register_named_custom_shader(...)`
 - `unregister_named_custom_shader(...)`
-- `clear_shader_surface_draws(...)`
-- `push_shader_surface_draw(...)`
+- `submit_render_primitive(...)`
 - `ShaderSurfaceDraw`
 
 With this mode, shaders are assigned by key per surface draw, so different UI regions can use different shaders.
@@ -86,7 +85,7 @@ Global mode convenience:
 You can use GPUI's `shader_surface(...)` element:
 1. In `shader_surface` prepaint, read the element `bounds`.
 2. Convert bounds to normalized window coordinates.
-3. Push a `ShaderSurfaceDraw` with `shader_key`, `normalized_bounds`, and optional `uniform_bytes`.
+3. Submit a `RenderPrimitive` containing a `ShaderSurfaceDraw` with `shader_key`, `normalized_bounds`, and optional `uniform_bytes`.
 4. In WGSL, discard or output transparent outside that rectangle (or rely on renderer scissor).
 
 This lets shader output track a real layout region rather than hardcoded screen UV values.
@@ -115,4 +114,4 @@ See:
 
 That example registers a named shader and assigns it to a `shader_surface` element via:
 - `register_named_custom_shader(...)`
-- `push_shader_surface_draw(...)`
+- `submit_render_primitive(...)`

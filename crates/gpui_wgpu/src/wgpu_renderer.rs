@@ -8,6 +8,7 @@ use gpui::{
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -109,9 +110,7 @@ pub struct CustomShaderDescriptor<'a> {
 pub enum CustomShaderTextureMode {
     #[default]
     None,
-    Texture2d,
-    Texture2dPair,
-    Texture2dPairWith3d,
+    VideoPlayerFull,
 }
 
 #[derive(Clone)]
@@ -160,6 +159,24 @@ static SHADER_SURFACE_TEXTURE_UPDATES_NV12: OnceLock<
 > = OnceLock::new();
 static SHADER_SURFACE_TEXTURE3D_UPDATES: OnceLock<Mutex<HashMap<String, ShaderSurfaceTexture3dData>>> =
     OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_CAPTION: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTextureData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_RGBA_VIDEO: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTextureData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_BROLL: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTextureData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_BROLL_NV12: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTexturePairData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_BROLL_LUT3D: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTexture3dData>>,
+> = OnceLock::new();
+static PRIMITIVE_PIPELINES: OnceLock<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>> =
+    OnceLock::new();
+static PRIMITIVE_RENDER_CONTEXT: OnceLock<Mutex<Option<PrimitiveRenderContext>>> = OnceLock::new();
 
 fn global_custom_shader_config() -> &'static Mutex<Option<GlobalCustomShaderConfig>> {
     GLOBAL_CUSTOM_SHADER_CONFIG.get_or_init(|| Mutex::new(None))
@@ -192,46 +209,133 @@ fn named_custom_shader_configs() -> &'static Mutex<HashMap<String, GlobalCustomS
     NAMED_CUSTOM_SHADER_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn shader_surface_draws() -> &'static Mutex<Vec<ShaderSurfaceDraw>> {
+fn render_primitive_draws() -> &'static Mutex<Vec<ShaderSurfaceDraw>> {
     SHADER_SURFACE_DRAWS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn shader_surface_texture_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+fn render_primitive_texture_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
     SHADER_SURFACE_TEXTURE_UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn shader_surface_texture_updates_pair()
+fn render_primitive_texture_updates_pair()
 -> &'static Mutex<HashMap<String, ShaderSurfaceTexturePairData>> {
     SHADER_SURFACE_TEXTURE_UPDATES_NV12.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn shader_surface_texture_3d_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTexture3dData>> {
+fn render_primitive_texture_3d_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTexture3dData>> {
     SHADER_SURFACE_TEXTURE3D_UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn take_shader_surface_draws() -> Vec<ShaderSurfaceDraw> {
-    shader_surface_draws()
+fn render_primitive_texture_caption_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_CAPTION.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_rgba_video_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_RGBA_VIDEO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_broll_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_BROLL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_broll_nv12_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTexturePairData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_BROLL_NV12.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_broll_lut3d_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTexture3dData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_BROLL_LUT3D.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn primitive_pipelines() -> &'static Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>> {
+    PRIMITIVE_PIPELINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone)]
+struct PrimitiveRenderContext {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    format: wgpu::TextureFormat,
+}
+
+fn primitive_render_context() -> &'static Mutex<Option<PrimitiveRenderContext>> {
+    PRIMITIVE_RENDER_CONTEXT.get_or_init(|| Mutex::new(None))
+}
+
+fn set_primitive_render_context(
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    format: wgpu::TextureFormat,
+) {
+    if let Ok(mut slot) = primitive_render_context().lock() {
+        *slot = Some(PrimitiveRenderContext {
+            device,
+            queue,
+            format,
+        });
+    }
+}
+
+fn take_render_primitive_draws() -> Vec<ShaderSurfaceDraw> {
+    render_primitive_draws()
         .lock()
         .map(|mut draws| std::mem::take(&mut *draws))
         .unwrap_or_default()
 }
 
-fn take_shader_surface_texture_updates() -> HashMap<String, ShaderSurfaceTextureData> {
-    shader_surface_texture_updates()
+fn take_render_primitive_texture_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_updates()
         .lock()
         .map(|mut updates| std::mem::take(&mut *updates))
         .unwrap_or_default()
 }
 
-fn take_shader_surface_texture_updates_pair() -> HashMap<String, ShaderSurfaceTexturePairData> {
-    shader_surface_texture_updates_pair()
+fn take_render_primitive_texture_updates_pair() -> HashMap<String, ShaderSurfaceTexturePairData> {
+    render_primitive_texture_updates_pair()
         .lock()
         .map(|mut updates| std::mem::take(&mut *updates))
         .unwrap_or_default()
 }
 
-fn take_shader_surface_texture_3d_updates() -> HashMap<String, ShaderSurfaceTexture3dData> {
-    shader_surface_texture_3d_updates()
+fn take_render_primitive_texture_3d_updates() -> HashMap<String, ShaderSurfaceTexture3dData> {
+    render_primitive_texture_3d_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_caption_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_caption_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_rgba_video_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_rgba_video_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_broll_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_broll_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_broll_nv12_updates() -> HashMap<String, ShaderSurfaceTexturePairData> {
+    render_primitive_texture_broll_nv12_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_broll_lut3d_updates() -> HashMap<String, ShaderSurfaceTexture3dData> {
+    render_primitive_texture_broll_lut3d_updates()
         .lock()
         .map(|mut updates| std::mem::take(&mut *updates))
         .unwrap_or_default()
@@ -282,12 +386,6 @@ pub fn unregister_named_custom_shader(shader_key: &str) {
     }
 }
 
-pub fn clear_shader_surface_draws() {
-    if let Ok(mut draws) = shader_surface_draws().lock() {
-        draws.clear();
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ShaderSurfaceDraw {
     pub shader_key: String,
@@ -296,8 +394,8 @@ pub struct ShaderSurfaceDraw {
     pub texture_key: Option<String>,
 }
 
-pub fn push_shader_surface_draw(draw: ShaderSurfaceDraw) {
-    if let Ok(mut draws) = shader_surface_draws().lock() {
+fn queue_render_primitive_draw(draw: ShaderSurfaceDraw) {
+    if let Ok(mut draws) = render_primitive_draws().lock() {
         draws.push(draw);
     }
 }
@@ -309,7 +407,7 @@ pub enum ShaderSurfaceTextureFormat {
 }
 
 #[derive(Clone, Debug)]
-pub struct ShaderSurfaceTextureData {
+struct ShaderSurfaceTextureData {
     pub key: String,
     pub width: u32,
     pub height: u32,
@@ -318,7 +416,7 @@ pub struct ShaderSurfaceTextureData {
 }
 
 #[derive(Clone, Debug)]
-pub struct ShaderSurfaceTexturePairData {
+struct ShaderSurfaceTexturePairData {
     pub key: String,
     pub width: u32,
     pub height: u32,
@@ -327,38 +425,348 @@ pub struct ShaderSurfaceTexturePairData {
 }
 
 #[derive(Clone, Debug)]
-pub struct ShaderSurfaceTexture3dData {
+struct ShaderSurfaceTexture3dData {
     pub key: String,
     pub size: u32,
     pub data: Vec<u8>,
 }
 
-pub fn upsert_shader_surface_texture(texture: ShaderSurfaceTextureData) {
-    if let Ok(mut updates) = shader_surface_texture_updates().lock() {
+#[derive(Clone, Debug)]
+pub struct RenderPrimitiveTexture2d {
+    pub binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+    pub format: ShaderSurfaceTextureFormat,
+}
+
+impl RenderPrimitiveTexture2d {
+    pub fn new(
+        binding: u32,
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+        format: ShaderSurfaceTextureFormat,
+    ) -> Self {
+        Self {
+            binding,
+            width,
+            height,
+            bytes,
+            format,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderPrimitiveTexturePair {
+    pub y_binding: u32,
+    pub uv_binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub data: Vec<u8>,
+}
+
+impl RenderPrimitiveTexturePair {
+    pub fn new(
+        y_binding: u32,
+        uv_binding: u32,
+        width: u32,
+        height: u32,
+        stride: u32,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            y_binding,
+            uv_binding,
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderPrimitiveTexture3d {
+    pub binding: u32,
+    pub size: u32,
+    pub data: Vec<u8>,
+}
+
+impl RenderPrimitiveTexture3d {
+    pub fn new(binding: u32, size: u32, data: Vec<u8>) -> Self {
+        Self {
+            binding,
+            size,
+            data,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RenderPrimitive {
+    pub draw: Option<ShaderSurfaceDraw>,
+    pub texture_key: Option<String>,
+    pub textures_2d: Vec<RenderPrimitiveTexture2d>,
+    pub textures_nv12: Vec<RenderPrimitiveTexturePair>,
+    pub textures_3d: Vec<RenderPrimitiveTexture3d>,
+}
+
+impl RenderPrimitive {
+    pub fn new(texture_key: impl Into<String>) -> Self {
+        Self {
+            draw: None,
+            texture_key: Some(texture_key.into()),
+            textures_2d: Vec::new(),
+            textures_nv12: Vec::new(),
+            textures_3d: Vec::new(),
+        }
+    }
+
+    pub fn draw(mut self, draw: ShaderSurfaceDraw) -> Self {
+        self.draw = Some(draw);
+        self
+    }
+
+    pub fn with_texture_2d(mut self, texture: RenderPrimitiveTexture2d) -> Self {
+        self.textures_2d.push(texture);
+        self
+    }
+
+    pub fn with_texture_nv12(mut self, texture: RenderPrimitiveTexturePair) -> Self {
+        self.textures_nv12.push(texture);
+        self
+    }
+
+    pub fn with_texture_3d(mut self, texture: RenderPrimitiveTexture3d) -> Self {
+        self.textures_3d.push(texture);
+        self
+    }
+}
+
+pub trait PrimitivePipeline: Send + Sync + 'static {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self
+    where
+        Self: Sized;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PrimitiveBounds {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PrimitiveViewport {
+    pub width: f32,
+    pub height: f32,
+}
+
+pub trait Primitive: std::fmt::Debug + Send + Sync + 'static {
+    type Pipeline: PrimitivePipeline;
+
+    fn prepare(
+        &self,
+        pipeline: &mut Self::Pipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bounds: &PrimitiveBounds,
+        viewport: &PrimitiveViewport,
+    );
+    fn render(
+        &self,
+        pipeline: &Self::Pipeline,
+        bounds: &PrimitiveBounds,
+        viewport: &PrimitiveViewport,
+    ) -> RenderPrimitive;
+}
+
+pub fn draw_primitive<P: Primitive>(
+    bounds: PrimitiveBounds,
+    viewport: PrimitiveViewport,
+    primitive: P,
+) {
+    let context = match primitive_render_context().lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(context) = context else {
+        return;
+    };
+
+    let type_id = TypeId::of::<P::Pipeline>();
+    let mut pipelines = match primitive_pipelines().lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    pipelines
+        .entry(type_id)
+        .or_insert_with(|| {
+            Box::new(<P::Pipeline as PrimitivePipeline>::new(
+                &context.device,
+                &context.queue,
+                context.format,
+            ))
+        });
+
+    {
+        let Some(pipeline_any) = pipelines.get_mut(&type_id) else {
+            return;
+        };
+        let Some(pipeline) = pipeline_any.downcast_mut::<P::Pipeline>() else {
+            return;
+        };
+        primitive.prepare(
+            pipeline,
+            &context.device,
+            &context.queue,
+            &bounds,
+            &viewport,
+        );
+    }
+
+    let render_primitive = {
+        let Some(pipeline_any) = pipelines.get(&type_id) else {
+            return;
+        };
+        let Some(pipeline) = pipeline_any.downcast_ref::<P::Pipeline>() else {
+            return;
+        };
+        primitive.render(pipeline, &bounds, &viewport)
+    };
+
+    drop(pipelines);
+    submit_render_primitive(render_primitive);
+}
+
+fn upsert_shader_surface_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_updates().lock() {
         updates.insert(texture.key.clone(), texture);
     }
 }
 
-pub fn upsert_shader_surface_texture_pair(texture: ShaderSurfaceTexturePairData) {
-    if let Ok(mut updates) = shader_surface_texture_updates_pair().lock() {
+fn upsert_shader_surface_texture_pair(texture: ShaderSurfaceTexturePairData) {
+    if let Ok(mut updates) = render_primitive_texture_updates_pair().lock() {
         updates.insert(texture.key.clone(), texture);
     }
 }
 
-pub fn upsert_shader_surface_texture_3d(lut: ShaderSurfaceTexture3dData) {
-    if let Ok(mut updates) = shader_surface_texture_3d_updates().lock() {
+fn upsert_shader_surface_texture_3d(lut: ShaderSurfaceTexture3dData) {
+    if let Ok(mut updates) = render_primitive_texture_3d_updates().lock() {
         updates.insert(lut.key.clone(), lut);
     }
 }
 
-pub fn remove_shader_surface_texture(key: &str) {
-    if let Ok(mut updates) = shader_surface_texture_updates().lock() {
+fn upsert_shader_surface_caption_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_caption_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_rgba_video_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_rgba_video_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_broll_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_broll_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_broll_texture_pair(texture: ShaderSurfaceTexturePairData) {
+    if let Ok(mut updates) = render_primitive_texture_broll_nv12_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_broll_texture_3d(lut: ShaderSurfaceTexture3dData) {
+    if let Ok(mut updates) = render_primitive_texture_broll_lut3d_updates().lock() {
+        updates.insert(lut.key.clone(), lut);
+    }
+}
+
+pub fn submit_render_primitive(primitive: RenderPrimitive) {
+    if let Some(draw) = primitive.draw {
+        queue_render_primitive_draw(draw);
+    }
+
+    let Some(texture_key) = primitive.texture_key else {
+        return;
+    };
+
+    for tex in primitive.textures_2d {
+        let update = ShaderSurfaceTextureData {
+            key: texture_key.clone(),
+            width: tex.width,
+            height: tex.height,
+            bytes: tex.bytes,
+            format: tex.format,
+        };
+        match tex.binding {
+            6 => upsert_shader_surface_caption_texture(update),
+            8 => upsert_shader_surface_rgba_video_texture(update),
+            9 => upsert_shader_surface_broll_texture(update),
+            _ => upsert_shader_surface_texture(update),
+        }
+    }
+
+    for tex in primitive.textures_nv12 {
+        let update = ShaderSurfaceTexturePairData {
+            key: texture_key.clone(),
+            width: tex.width,
+            height: tex.height,
+            stride: tex.stride,
+            data: tex.data,
+        };
+        match (tex.y_binding, tex.uv_binding) {
+            (13, 14) => upsert_shader_surface_broll_texture_pair(update),
+            _ => upsert_shader_surface_texture_pair(update),
+        }
+    }
+
+    for tex in primitive.textures_3d {
+        let update = ShaderSurfaceTexture3dData {
+            key: texture_key.clone(),
+            size: tex.size,
+            data: tex.data,
+        };
+        match tex.binding {
+            11 => upsert_shader_surface_broll_texture_3d(update),
+            _ => upsert_shader_surface_texture_3d(update),
+        }
+    }
+}
+
+pub fn remove_render_primitive_texture(key: &str) {
+    if let Ok(mut updates) = render_primitive_texture_updates().lock() {
         updates.remove(key);
     }
-    if let Ok(mut updates) = shader_surface_texture_updates_pair().lock() {
+    if let Ok(mut updates) = render_primitive_texture_updates_pair().lock() {
         updates.remove(key);
     }
-    if let Ok(mut updates) = shader_surface_texture_3d_updates().lock() {
+    if let Ok(mut updates) = render_primitive_texture_3d_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_caption_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_rgba_video_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_broll_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_broll_nv12_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_broll_lut3d_updates().lock() {
         updates.remove(key);
     }
 }
@@ -406,6 +814,18 @@ struct ShaderSurfaceTextureGpu {
     height: u32,
     texture_3d: Option<wgpu::Texture>,
     view_3d: Option<wgpu::TextureView>,
+    texture_caption: Option<wgpu::Texture>,
+    view_caption: Option<wgpu::TextureView>,
+    texture_rgba: Option<wgpu::Texture>,
+    view_rgba: Option<wgpu::TextureView>,
+    texture_broll: Option<wgpu::Texture>,
+    view_broll: Option<wgpu::TextureView>,
+    texture_broll_y: Option<wgpu::Texture>,
+    view_broll_y: Option<wgpu::TextureView>,
+    texture_broll_uv: Option<wgpu::Texture>,
+    view_broll_uv: Option<wgpu::TextureView>,
+    texture_broll_3d: Option<wgpu::Texture>,
+    view_broll_3d: Option<wgpu::TextureView>,
 }
 
 struct WgpuPipelines {
@@ -784,6 +1204,7 @@ impl WgpuRenderer {
         });
 
         let adapter_info = context.adapter.get_info();
+        set_primitive_render_context(Arc::clone(&device), Arc::clone(&queue), surface_format);
 
         Ok(Self {
             device,
@@ -1385,7 +1806,7 @@ impl WgpuRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         self.ensure_global_custom_shader();
-        let shader_surface_draws = take_shader_surface_draws();
+        let shader_surface_draws = take_render_primitive_draws();
         self.ensure_named_custom_shaders(&shader_surface_draws);
         let runtime = global_custom_shader_runtime()
             .lock()
@@ -1472,9 +1893,9 @@ impl WgpuRenderer {
             });
         }
         match descriptor.texture_mode {
-            CustomShaderTextureMode::Texture2d => {
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+            CustomShaderTextureMode::VideoPlayerFull => {
+                let tex2d_entry = |binding| wgpu::BindGroupLayoutEntry {
+                    binding,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -1482,71 +1903,9 @@ impl WgpuRenderer {
                         multisampled: false,
                     },
                     count: None,
-                });
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                });
-            }
-            CustomShaderTextureMode::Texture2dPair => {
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                });
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                });
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                });
-            }
-            CustomShaderTextureMode::Texture2dPairWith3d => {
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                });
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                });
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                });
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 4,
+                };
+                let tex3d_entry = |binding| wgpu::BindGroupLayoutEntry {
+                    binding,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -1554,13 +1913,28 @@ impl WgpuRenderer {
                         multisampled: false,
                     },
                     count: None,
-                });
-                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                };
+                let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+                    binding,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
-                });
+                };
+
+                bind_group_layout_entries.push(tex2d_entry(1));
+                bind_group_layout_entries.push(tex2d_entry(2));
+                bind_group_layout_entries.push(sampler_entry(3));
+                bind_group_layout_entries.push(tex3d_entry(4));
+                bind_group_layout_entries.push(sampler_entry(5));
+                bind_group_layout_entries.push(tex2d_entry(6));
+                bind_group_layout_entries.push(sampler_entry(7));
+                bind_group_layout_entries.push(tex2d_entry(8));
+                bind_group_layout_entries.push(tex2d_entry(9));
+                bind_group_layout_entries.push(sampler_entry(10));
+                bind_group_layout_entries.push(tex3d_entry(11));
+                bind_group_layout_entries.push(sampler_entry(12));
+                bind_group_layout_entries.push(tex2d_entry(13));
+                bind_group_layout_entries.push(tex2d_entry(14));
             }
             CustomShaderTextureMode::None => {}
         }
@@ -2046,40 +2420,7 @@ impl WgpuRenderer {
         }
 
         match shader.texture_mode {
-            CustomShaderTextureMode::Texture2d => {
-                let view = texture_entry
-                    .map(|entry| &entry.view_primary)
-                    .unwrap_or(&self.custom_shader_fallback_texture_view);
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(view),
-                });
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
-                });
-            }
-            CustomShaderTextureMode::Texture2dPair => {
-                let view_y = texture_entry
-                    .map(|entry| &entry.view_primary)
-                    .unwrap_or(&self.custom_shader_fallback_texture_view);
-                let view_uv = texture_entry
-                    .and_then(|entry| entry.view_secondary.as_ref())
-                    .unwrap_or(&self.custom_shader_fallback_texture_view);
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(view_y),
-                });
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(view_uv),
-                });
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
-                });
-            }
-            CustomShaderTextureMode::Texture2dPairWith3d => {
+            CustomShaderTextureMode::VideoPlayerFull => {
                 let view_y = texture_entry
                     .map(|entry| &entry.view_primary)
                     .unwrap_or(&self.custom_shader_fallback_texture_view);
@@ -2089,6 +2430,25 @@ impl WgpuRenderer {
                 let lut_view = texture_entry
                     .and_then(|entry| entry.view_3d.as_ref())
                     .unwrap_or(&self.custom_shader_fallback_view_3d);
+                let caption_view = texture_entry
+                    .and_then(|entry| entry.view_caption.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let rgba_view = texture_entry
+                    .and_then(|entry| entry.view_rgba.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let broll_view = texture_entry
+                    .and_then(|entry| entry.view_broll.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let broll_lut_view = texture_entry
+                    .and_then(|entry| entry.view_broll_3d.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_view_3d);
+                let broll_y_view = texture_entry
+                    .and_then(|entry| entry.view_broll_y.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let broll_uv_view = texture_entry
+                    .and_then(|entry| entry.view_broll_uv.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+
                 entries.push(wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(view_y),
@@ -2108,6 +2468,42 @@ impl WgpuRenderer {
                 entries.push(wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(caption_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(rgba_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(broll_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(broll_lut_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(broll_y_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(broll_uv_view),
                 });
             }
             CustomShaderTextureMode::None => {}
@@ -2225,9 +2621,14 @@ impl WgpuRenderer {
     }
 
     fn sync_shader_surface_textures(&mut self) {
-        let updates_rgba = take_shader_surface_texture_updates();
-        let updates_pair = take_shader_surface_texture_updates_pair();
-        let updates_3d = take_shader_surface_texture_3d_updates();
+        let updates_rgba = take_render_primitive_texture_updates();
+        let updates_pair = take_render_primitive_texture_updates_pair();
+        let updates_3d = take_render_primitive_texture_3d_updates();
+        let updates_caption = take_render_primitive_texture_caption_updates();
+        let updates_rgba_video = take_render_primitive_texture_rgba_video_updates();
+        let updates_broll = take_render_primitive_texture_broll_updates();
+        let updates_broll_nv12 = take_render_primitive_texture_broll_nv12_updates();
+        let updates_broll_lut3d = take_render_primitive_texture_broll_lut3d_updates();
 
         for (key, update) in updates_rgba {
             if update.width == 0 || update.height == 0 {
@@ -2245,7 +2646,7 @@ impl WgpuRenderer {
                 .map(|existing| {
                     existing.width != update.width
                         || existing.height != update.height
-                        || existing.mode != CustomShaderTextureMode::Texture2d
+                        || existing.mode != CustomShaderTextureMode::VideoPlayerFull
                 })
                 .unwrap_or(true);
 
@@ -2273,11 +2674,23 @@ impl WgpuRenderer {
                         view_primary,
                         texture_secondary: None,
                         view_secondary: None,
-                        mode: CustomShaderTextureMode::Texture2d,
+                        mode: CustomShaderTextureMode::VideoPlayerFull,
                         width: update.width,
                         height: update.height,
                         texture_3d: None,
                         view_3d: None,
+                        texture_caption: None,
+                        view_caption: None,
+                        texture_rgba: None,
+                        view_rgba: None,
+                        texture_broll: None,
+                        view_broll: None,
+                        texture_broll_y: None,
+                        view_broll_y: None,
+                        texture_broll_uv: None,
+                        view_broll_uv: None,
+                        texture_broll_3d: None,
+                        view_broll_3d: None,
                     },
                 );
             }
@@ -2325,8 +2738,7 @@ impl WgpuRenderer {
                 .map(|existing| {
                     existing.width != update.width
                         || existing.height != update.height
-                        || (existing.mode != CustomShaderTextureMode::Texture2dPair
-                            && existing.mode != CustomShaderTextureMode::Texture2dPairWith3d)
+                        || existing.mode != CustomShaderTextureMode::VideoPlayerFull
                 })
                 .unwrap_or(true);
 
@@ -2372,11 +2784,23 @@ impl WgpuRenderer {
                         view_primary,
                         texture_secondary: Some(texture_secondary),
                         view_secondary: Some(view_secondary),
-                        mode: CustomShaderTextureMode::Texture2dPairWith3d,
+                        mode: CustomShaderTextureMode::VideoPlayerFull,
                         width: update.width,
                         height: update.height,
                         texture_3d: None,
                         view_3d: None,
+                        texture_caption: None,
+                        view_caption: None,
+                        texture_rgba: None,
+                        view_rgba: None,
+                        texture_broll: None,
+                        view_broll: None,
+                        texture_broll_y: None,
+                        view_broll_y: None,
+                        texture_broll_uv: None,
+                        view_broll_uv: None,
+                        texture_broll_3d: None,
+                        view_broll_3d: None,
                     },
                 );
             }
@@ -2486,10 +2910,253 @@ impl WgpuRenderer {
 
             entry.texture_3d = Some(lut_texture);
             entry.view_3d = Some(lut_view);
-            if entry.mode == CustomShaderTextureMode::Texture2dPair {
-                entry.mode = CustomShaderTextureMode::Texture2dPairWith3d;
-            }
+            entry.mode = CustomShaderTextureMode::VideoPlayerFull;
         }
+
+        for (key, update) in updates_caption {
+            self.apply_aux_2d_texture_update(&key, update, |entry, texture, view| {
+                entry.texture_caption = Some(texture);
+                entry.view_caption = Some(view);
+            });
+        }
+
+        for (key, update) in updates_rgba_video {
+            self.apply_aux_2d_texture_update(&key, update, |entry, texture, view| {
+                entry.texture_rgba = Some(texture);
+                entry.view_rgba = Some(view);
+            });
+        }
+
+        for (key, update) in updates_broll {
+            self.apply_aux_2d_texture_update(&key, update, |entry, texture, view| {
+                entry.texture_broll = Some(texture);
+                entry.view_broll = Some(view);
+            });
+        }
+
+        for (key, update) in updates_broll_nv12 {
+            self.apply_aux_nv12_texture_update(&key, update, |entry, y_tex, y_view, uv_tex, uv_view| {
+                entry.texture_broll_y = Some(y_tex);
+                entry.view_broll_y = Some(y_view);
+                entry.texture_broll_uv = Some(uv_tex);
+                entry.view_broll_uv = Some(uv_view);
+            });
+        }
+
+        for (key, lut) in updates_broll_lut3d {
+            if lut.size == 0 {
+                continue;
+            }
+            let Some(entry) = self.shader_surface_textures.get_mut(&key) else {
+                continue;
+            };
+
+            let expected_len = (lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(4);
+            if lut.data.len() < expected_len {
+                continue;
+            }
+
+            let lut_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shader_surface_texture3d_broll"),
+                size: wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let lut_view = lut_texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &lut_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &lut.data[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lut.size * 4),
+                    rows_per_image: Some(lut.size),
+                },
+                wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+            );
+
+            entry.texture_broll_3d = Some(lut_texture);
+            entry.view_broll_3d = Some(lut_view);
+        }
+    }
+
+    fn apply_aux_2d_texture_update<F>(
+        &mut self,
+        key: &str,
+        update: ShaderSurfaceTextureData,
+        mut assign: F,
+    ) where
+        F: FnMut(&mut ShaderSurfaceTextureGpu, wgpu::Texture, wgpu::TextureView),
+    {
+        if update.width == 0 || update.height == 0 {
+            return;
+        }
+        let expected_len = update.width as usize * update.height as usize * 4;
+        if update.bytes.len() < expected_len {
+            return;
+        }
+        let Some(entry) = self.shader_surface_textures.get_mut(key) else {
+            return;
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shader_surface_texture_aux2d"),
+            size: wgpu::Extent3d {
+                width: update.width,
+                height: update.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::shader_surface_texture_format(update.format),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &update.bytes[..expected_len],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(update.width * 4),
+                rows_per_image: Some(update.height),
+            },
+            wgpu::Extent3d {
+                width: update.width,
+                height: update.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        assign(entry, texture, view);
+    }
+
+    fn apply_aux_nv12_texture_update<F>(
+        &mut self,
+        key: &str,
+        update: ShaderSurfaceTexturePairData,
+        mut assign: F,
+    ) where
+        F: FnMut(
+            &mut ShaderSurfaceTextureGpu,
+            wgpu::Texture,
+            wgpu::TextureView,
+            wgpu::Texture,
+            wgpu::TextureView,
+        ),
+    {
+        if update.width == 0 || update.height == 0 || update.stride == 0 {
+            return;
+        }
+        let y_plane_size = (update.stride * update.height) as usize;
+        let uv_plane_size = (update.stride * (update.height / 2)) as usize;
+        let total_size = y_plane_size + uv_plane_size;
+        if update.data.len() < total_size {
+            return;
+        }
+        let Some(entry) = self.shader_surface_textures.get_mut(key) else {
+            return;
+        };
+
+        let texture_y = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shader_surface_texture_aux_nv12_y"),
+            size: wgpu::Extent3d {
+                width: update.width,
+                height: update.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let texture_uv = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shader_surface_texture_aux_nv12_uv"),
+            size: wgpu::Extent3d {
+                width: update.width / 2,
+                height: update.height / 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture_y,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &update.data[..y_plane_size],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(update.stride),
+                rows_per_image: Some(update.height),
+            },
+            wgpu::Extent3d {
+                width: update.width,
+                height: update.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture_uv,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &update.data[y_plane_size..total_size],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(update.stride),
+                rows_per_image: Some(update.height / 2),
+            },
+            wgpu::Extent3d {
+                width: update.width / 2,
+                height: update.height / 2,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view_y = texture_y.create_view(&wgpu::TextureViewDescriptor::default());
+        let view_uv = texture_uv.create_view(&wgpu::TextureViewDescriptor::default());
+        assign(entry, texture_y, view_y, texture_uv, view_uv);
     }
 
     fn shader_surface_texture_format(format: ShaderSurfaceTextureFormat) -> wgpu::TextureFormat {
