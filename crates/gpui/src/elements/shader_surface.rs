@@ -7,18 +7,16 @@ use refineable::Refineable as _;
 /// A layout element intended for renderer-side shader surfaces.
 ///
 /// This element itself does not issue draw calls. It reports its resolved bounds
-/// during prepaint so renderer integrations can enqueue custom shader work.
+/// during paint so renderer integrations can enqueue custom shader work.
 pub struct ShaderSurface {
-    on_prepaint: Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App)>>,
+    on_paint: Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App)>>,
     style: StyleRefinement,
 }
 
-/// Construct a shader-surface element and run `on_prepaint` with its resolved bounds.
-pub fn shader_surface(
-    on_prepaint: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App),
-) -> ShaderSurface {
+/// Construct a shader-surface element and run `on_paint` with its resolved bounds.
+pub fn shader_surface(on_paint: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App)) -> ShaderSurface {
     ShaderSurface {
-        on_prepaint: Some(Box::new(on_prepaint)),
+        on_paint: Some(Box::new(on_paint)),
         style: StyleRefinement::default(),
     }
 }
@@ -60,26 +58,26 @@ impl Element for ShaderSurface {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
+        _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
+        _window: &mut Window,
+        _cx: &mut App,
     ) -> Self::PrepaintState {
-        if let Some(on_prepaint) = self.on_prepaint.take() {
-            on_prepaint(bounds, window, cx);
-        }
     }
 
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _style: &mut Style,
         _prepaint: &mut Self::PrepaintState,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
+        if let Some(on_paint) = self.on_paint.take() {
+            window.paint_layer(bounds, |window| on_paint(bounds, window, cx));
+        }
     }
 }
 

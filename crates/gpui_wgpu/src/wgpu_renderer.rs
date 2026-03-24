@@ -1,9 +1,9 @@
 use crate::{WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite,
+    PaintShaderSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    ShaderSurfaceDraw, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -265,6 +265,7 @@ fn primitive_render_context() -> &'static Mutex<Option<PrimitiveRenderContext>> 
     PRIMITIVE_RENDER_CONTEXT.get_or_init(|| Mutex::new(None))
 }
 
+
 fn set_primitive_render_context(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -405,14 +406,6 @@ pub fn unregister_named_custom_shader(shader_key: &str) {
     if let Ok(mut configs) = named_custom_shader_configs().lock() {
         configs.remove(shader_key);
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct ShaderSurfaceDraw {
-    pub shader_key: String,
-    pub normalized_bounds: [f32; 4],
-    pub uniform_bytes: Option<Vec<u8>>,
-    pub texture_key: Option<String>,
 }
 
 fn queue_render_primitive_draw(draw: ShaderSurfaceDraw) {
@@ -1839,6 +1832,12 @@ impl WgpuRenderer {
         self.ensure_global_custom_shader();
         let shader_surface_draws = take_render_primitive_draws();
         self.ensure_named_custom_shaders(&shader_surface_draws);
+        let scene_shader_surface_draws: Vec<_> = scene
+            .shader_surfaces
+            .iter()
+            .map(|surface| surface.draw.clone())
+            .collect();
+        self.ensure_named_custom_shaders(&scene_shader_surface_draws);
         let runtime = global_custom_shader_runtime()
             .lock()
             .map(|runtime| runtime.clone())
@@ -2220,12 +2219,75 @@ impl WgpuRenderer {
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
-
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("main_encoder"),
                 });
+
+            {
+                let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("clear_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+            }
+
+            for draw in shader_surface_draws {
+                let Some(named_shader) = self.named_custom_shaders.get(&draw.shader_key) else {
+                    continue;
+                };
+                if let Err(error) = self.update_named_custom_shader_uniforms(
+                    named_shader,
+                    draw.uniform_bytes.as_deref(),
+                    custom_shader_time_seconds,
+                ) {
+                    log::error!(
+                        "Failed to update shader surface uniforms for '{}': {error:#}",
+                        draw.shader_key
+                    );
+                    continue;
+                }
+
+                let Some((x, y, width, height)) = self.normalized_bounds_to_scissor(draw) else {
+                    continue;
+                };
+
+                if named_shader.shader.vertex_count == 0 || named_shader.shader.instance_count == 0
+                {
+                    continue;
+                }
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shader_surface_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_scissor_rect(x, y, width, height);
+                let texture_entry = draw
+                    .texture_key
+                    .as_ref()
+                    .and_then(|key| self.shader_surface_textures.get(key));
+                self.draw_custom_shader_pass(&named_shader.shader, &mut pass, texture_entry);
+            }
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2234,7 +2296,7 @@ impl WgpuRenderer {
                         view: &frame_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -2318,6 +2380,38 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
+                        PrimitiveBatch::ShaderSurfaces(range) => {
+                            let shader_surfaces = &scene.shader_surfaces[range];
+                            if shader_surfaces.is_empty() {
+                                continue;
+                            }
+
+                            drop(pass);
+
+                            self.draw_shader_surfaces(
+                                &mut encoder,
+                                &frame_view,
+                                shader_surfaces,
+                                custom_shader_time_seconds,
+                            );
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            true
+                        }
                         PrimitiveBatch::Surfaces(_surfaces) => {
                             // Surfaces are macOS-only for video playback
                             // Not implemented for Linux/wgpu
@@ -2349,53 +2443,6 @@ impl WgpuRenderer {
                     });
                     self.draw_custom_shader_pass(shader, &mut pass, None);
                 }
-            }
-
-            for draw in shader_surface_draws {
-                let Some(named_shader) = self.named_custom_shaders.get(&draw.shader_key) else {
-                    continue;
-                };
-                if let Err(error) = self.update_named_custom_shader_uniforms(
-                    named_shader,
-                    draw.uniform_bytes.as_deref(),
-                    custom_shader_time_seconds,
-                ) {
-                    log::error!(
-                        "Failed to update shader surface uniforms for '{}': {error:#}",
-                        draw.shader_key
-                    );
-                    continue;
-                }
-
-                let Some((x, y, width, height)) = self.normalized_bounds_to_scissor(draw) else {
-                    continue;
-                };
-
-                if named_shader.shader.vertex_count == 0 || named_shader.shader.instance_count == 0
-                {
-                    continue;
-                }
-
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("shader_surface_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-                pass.set_scissor_rect(x, y, width, height);
-                let texture_entry = draw
-                    .texture_key
-                    .as_ref()
-                    .and_then(|key| self.shader_surface_textures.get(key));
-                self.draw_custom_shader_pass(&named_shader.shader, &mut pass, texture_entry);
             }
 
             if overflow {
@@ -3226,6 +3273,100 @@ impl WgpuRenderer {
         }
 
         Some((x, y, width, height))
+    }
+
+    fn shader_surface_bounds_to_scissor(
+        &self,
+        shader_surface: &PaintShaderSurface,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let clipped_bounds = shader_surface
+            .bounds
+            .intersect(&shader_surface.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return None;
+        }
+
+        let surface_width = self.surface_config.width as f32;
+        let surface_height = self.surface_config.height as f32;
+
+        let min_x = clipped_bounds.origin.x.0.clamp(0.0, surface_width);
+        let min_y = clipped_bounds.origin.y.0.clamp(0.0, surface_height);
+        let max_x =
+            (clipped_bounds.origin.x.0 + clipped_bounds.size.width.0).clamp(0.0, surface_width);
+        let max_y =
+            (clipped_bounds.origin.y.0 + clipped_bounds.size.height.0).clamp(0.0, surface_height);
+
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+
+        let x = min_x.floor() as u32;
+        let y = min_y.floor() as u32;
+        let max_x_px = max_x.ceil() as u32;
+        let max_y_px = max_y.ceil() as u32;
+        let width = max_x_px.saturating_sub(x);
+        let height = max_y_px.saturating_sub(y);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((x, y, width, height))
+    }
+
+    fn draw_shader_surfaces(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_view: &wgpu::TextureView,
+        shader_surfaces: &[PaintShaderSurface],
+        custom_shader_time_seconds: f32,
+    ) {
+        for shader_surface in shader_surfaces {
+            let draw = &shader_surface.draw;
+            let Some(named_shader) = self.named_custom_shaders.get(&draw.shader_key) else {
+                continue;
+            };
+            if let Err(error) = self.update_named_custom_shader_uniforms(
+                named_shader,
+                draw.uniform_bytes.as_deref(),
+                custom_shader_time_seconds,
+            ) {
+                log::error!(
+                    "Failed to update shader surface uniforms for '{}': {error:#}",
+                    draw.shader_key
+                );
+                continue;
+            }
+
+            let Some((x, y, width, height)) = self.shader_surface_bounds_to_scissor(shader_surface)
+            else {
+                continue;
+            };
+
+            if named_shader.shader.vertex_count == 0 || named_shader.shader.instance_count == 0 {
+                continue;
+            }
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene_shader_surface_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_scissor_rect(x, y, width, height);
+            let texture_entry = draw
+                .texture_key
+                .as_ref()
+                .and_then(|key| self.shader_surface_textures.get(key));
+            self.draw_custom_shader_pass(&named_shader.shader, &mut pass, texture_entry);
+        }
     }
 
     fn draw_quads(
