@@ -79,6 +79,11 @@ impl BackgroundExecutor {
         }
     }
 
+    /// Close this executor. Tasks will not run after this is called.
+    pub fn close(&self) {
+        // Newer scheduler versions do not expose a close primitive.
+    }
+
     /// Returns the underlying scheduler::BackgroundExecutor.
     ///
     /// This is used by Ex to pass the executor to thread/worktree code.
@@ -298,6 +303,11 @@ impl ForegroundExecutor {
             dispatcher,
             not_send: PhantomData,
         }
+    }
+
+    /// Close this executor. Tasks will not run after this is called.
+    pub fn close(&self) {
+        // Newer scheduler versions do not expose a close primitive.
     }
 
     /// Enqueues the given Task to run on the main thread.

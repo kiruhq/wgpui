@@ -27,12 +27,8 @@ use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
 pub use entity_map::*;
 use gpui_util::{ResultExt, debug_panic};
-#[cfg(any(test, feature = "test-support"))]
-pub use headless_app_context::*;
 use http_client::{HttpClient, Url};
 use smallvec::SmallVec;
-#[cfg(any(test, feature = "test-support"))]
-pub use test_app::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
@@ -49,8 +45,7 @@ use crate::{
     PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
     PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
     SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
+    ThermalState, Window, WindowAppearance, WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -58,10 +53,6 @@ use crate::{
 mod async_context;
 mod context;
 mod entity_map;
-#[cfg(any(test, feature = "test-support"))]
-mod headless_app_context;
-#[cfg(any(test, feature = "test-support"))]
-mod test_app;
 #[cfg(any(test, feature = "test-support"))]
 mod test_context;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
@@ -241,7 +232,7 @@ type Listener = Box<dyn FnMut(&dyn Any, &mut App) -> bool + 'static>;
 pub(crate) type KeystrokeObserver =
     Box<dyn FnMut(&KeystrokeEvent, &mut Window, &mut App) -> bool + 'static>;
 type QuitHandler = Box<dyn FnOnce(&mut App) -> LocalBoxFuture<'static, ()> + 'static>;
-type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowId)>;
+type WindowClosedHandler = Box<dyn FnMut(&mut App)>;
 type ReleaseListener = Box<dyn FnOnce(&mut dyn Any, &mut App) + 'static>;
 type NewEntityListener = Box<dyn FnMut(AnyEntity, &mut Option<&mut Window>, &mut App) + 'static>;
 
@@ -596,13 +587,21 @@ impl GpuiMode {
 pub struct App {
     pub(crate) this: Weak<AppCell>,
     pub(crate) platform: Rc<dyn Platform>,
+    pub(crate) mode: GpuiMode,
     text_system: Arc<TextSystem>,
-
+    flushing_effects: bool,
+    pending_updates: usize,
     pub(crate) actions: Rc<ActionRegistry>,
     pub(crate) active_drag: Option<AnyDrag>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
+    pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
+    asset_source: Arc<dyn AssetSource>,
+    pub(crate) svg_renderer: SvgRenderer,
+    http_client: Arc<dyn HttpClient>,
+    pub(crate) globals_by_type: FxHashMap<TypeId, Box<dyn Any>>,
     pub(crate) entities: EntityMap,
+    pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) new_entity_observers: SubscriberSet<TypeId, NewEntityListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Box<Window>>>,
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
@@ -613,8 +612,10 @@ pub struct App {
     pub(crate) global_action_listeners:
         FxHashMap<TypeId, Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
     pending_effects: VecDeque<Effect>,
-
+    pub(crate) pending_notifications: FxHashSet<EntityId>,
+    pub(crate) pending_global_notifications: FxHashSet<TypeId>,
     pub(crate) observers: SubscriberSet<EntityId, Handler>,
+    // TypeId is the type of the event that the listener callback expects
     pub(crate) event_listeners: SubscriberSet<EntityId, (TypeId, Listener)>,
     pub(crate) keystroke_observers: SubscriberSet<(), KeystrokeObserver>,
     pub(crate) keystroke_interceptors: SubscriberSet<(), KeystrokeObserver>,
@@ -624,30 +625,8 @@ pub struct App {
     pub(crate) global_observers: SubscriberSet<TypeId, Handler>,
     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
     pub(crate) restart_observers: SubscriberSet<(), Handler>,
-    pub(crate) window_closed_observers: SubscriberSet<(), WindowClosedHandler>,
-
-    /// Per-App element arena. This isolates element allocations between different
-    /// App instances (important for tests where multiple Apps run concurrently).
-    pub(crate) element_arena: RefCell<Arena>,
-    /// Per-App event arena.
-    pub(crate) event_arena: Arena,
-
-    // Drop globals last. We need to ensure all tasks owned by entities and
-    // callbacks are marked cancelled at this point as this will also shutdown
-    // the tokio runtime. As any task attempting to spawn a blocking tokio task,
-    // might panic.
-    pub(crate) globals_by_type: FxHashMap<TypeId, Box<dyn Any>>,
-
-    // assets
-    pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
-    asset_source: Arc<dyn AssetSource>,
-    pub(crate) svg_renderer: SvgRenderer,
-    http_client: Arc<dyn HttpClient>,
-
-    // below is plain data, the drop order is insignificant here
-    pub(crate) pending_notifications: FxHashSet<EntityId>,
-    pub(crate) pending_global_notifications: FxHashSet<TypeId>,
     pub(crate) restart_path: Option<PathBuf>,
+    pub(crate) window_closed_observers: SubscriberSet<(), WindowClosedHandler>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
     pub(crate) prompt_builder: Option<PromptBuilder>,
@@ -662,22 +641,22 @@ pub struct App {
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
-
-    pub(crate) window_update_stack: Vec<WindowId>,
-    pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
-    flushing_effects: bool,
-    pending_updates: usize,
     quit_mode: QuitMode,
     quitting: bool,
-
-    // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
-    // Otherwise it may report false positives.
-    #[cfg(any(test, feature = "leak-detection"))]
-    _ref_counts: Arc<RwLock<EntityRefCounts>>,
+    /// Per-App element arena. This isolates element allocations between different
+    /// App instances (important for tests where multiple Apps run concurrently).
+    pub(crate) element_arena: RefCell<Arena>,
+    /// Per-App event arena.
+    pub(crate) event_arena: Arena,
 }
 
 impl App {
+    #[doc(hidden)]
+    pub fn ref_counts_drop_handle(&self) -> EntityRefCountsDropHandle {
+        self.entities.ref_counts_drop_handle()
+    }
+
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
@@ -695,9 +674,6 @@ impl App {
         let entities = EntityMap::new();
         let keyboard_layout = platform.keyboard_layout();
         let keyboard_mapper = platform.keyboard_mapper();
-
-        #[cfg(any(test, feature = "leak-detection"))]
-        let _ref_counts = entities.ref_counts_drop_handle();
 
         let app = Rc::new_cyclic(|this| AppCell {
             app: RefCell::new(App {
@@ -760,9 +736,6 @@ impl App {
                 name: None,
                 element_arena: RefCell::new(Arena::new(1024 * 1024)),
                 event_arena: Arena::new(1024 * 1024),
-
-                #[cfg(any(test, feature = "leak-detection"))]
-                _ref_counts,
             }),
         });
 
@@ -796,46 +769,13 @@ impl App {
         }));
 
         platform.on_quit(Box::new({
-            let cx = Rc::downgrade(&app);
+            let cx = app.clone();
             move || {
-                if let Some(cx) = cx.upgrade() {
-                    cx.borrow_mut().shutdown();
-                }
+                cx.borrow_mut().shutdown();
             }
         }));
 
         app
-    }
-
-    #[doc(hidden)]
-    pub fn ref_counts_drop_handle(&self) -> impl Sized + use<> {
-        self.entities.ref_counts_drop_handle()
-    }
-
-    /// Captures a snapshot of all entities that currently have alive handles.
-    ///
-    /// The returned [`LeakDetectorSnapshot`] can later be passed to
-    /// [`assert_no_new_leaks`](Self::assert_no_new_leaks) to verify that no
-    /// entities created after the snapshot are still alive.
-    #[cfg(any(test, feature = "leak-detection"))]
-    pub fn leak_detector_snapshot(&self) -> LeakDetectorSnapshot {
-        self.entities.leak_detector_snapshot()
-    }
-
-    /// Asserts that no entities created after `snapshot` still have alive handles.
-    ///
-    /// Entities that were already tracked at the time of the snapshot are ignored,
-    /// even if they still have handles. Only *new* entities (those whose
-    /// `EntityId` was not present in the snapshot) are considered leaks.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any new entity handles exist. The panic message lists every
-    /// leaked entity with its type name, and includes allocation-site backtraces
-    /// when `LEAK_BACKTRACE` is set.
-    #[cfg(any(test, feature = "leak-detection"))]
-    pub fn assert_no_new_leaks(&self, snapshot: &LeakDetectorSnapshot) {
-        self.entities.assert_no_new_leaks(snapshot)
     }
 
     /// Quit the application gracefully. Handlers registered with [`Context::on_app_quit`]
@@ -1219,11 +1159,6 @@ impl App {
     /// Returns the appearance of the application's windows.
     pub fn window_appearance(&self) -> WindowAppearance {
         self.platform.window_appearance()
-    }
-
-    /// Returns the window button layout configuration when supported.
-    pub fn button_layout(&self) -> Option<WindowButtonLayout> {
-        self.platform.button_layout()
     }
 
     /// Reads data from the platform clipboard.
@@ -1652,7 +1587,7 @@ impl App {
                     }
 
                     cx.window_closed_observers.clone().retain(&(), |callback| {
-                        callback(cx, id);
+                        callback(cx);
                         true
                     });
 
@@ -1765,7 +1700,8 @@ impl App {
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
-            .unwrap_or_else(|| panic!("no state of type {} exists", type_name::<G>()))
+            .with_context(|| format!("no state of type {} exists", type_name::<G>()))
+            .unwrap()
     }
 
     /// Access the global of the given type if a value has been assigned.
@@ -1783,7 +1719,8 @@ impl App {
         self.globals_by_type
             .get_mut(&global_type)
             .and_then(|any_state| any_state.downcast_mut::<G>())
-            .unwrap_or_else(|| panic!("no state of type {} exists", type_name::<G>()))
+            .with_context(|| format!("no state of type {} exists", type_name::<G>()))
+            .unwrap()
     }
 
     /// Access the global of the given type mutably. A default value is assigned if a global of this type has not
@@ -1818,7 +1755,7 @@ impl App {
         *self
             .globals_by_type
             .remove(&global_type)
-            .unwrap_or_else(|| panic!("no global added for {}", type_name::<G>()))
+            .unwrap_or_else(|| panic!("no global added for {}", std::any::type_name::<G>()))
             .downcast()
             .unwrap()
     }
@@ -2124,10 +2061,7 @@ impl App {
 
     /// Register a callback to be invoked when a window is closed
     /// The window is no longer accessible at the point this callback is invoked.
-    pub fn on_window_closed(
-        &self,
-        mut on_closed: impl FnMut(&mut App, WindowId) + 'static,
-    ) -> Subscription {
+    pub fn on_window_closed(&self, mut on_closed: impl FnMut(&mut App) + 'static) -> Subscription {
         let (subscription, activate) = self.window_closed_observers.insert((), Box::new(on_closed));
         activate();
         subscription
@@ -2164,8 +2098,7 @@ impl App {
     }
 
     /// Sets the menu bar for this application. This will replace any existing menu bar.
-    pub fn set_menus(&self, menus: impl IntoIterator<Item = Menu>) {
-        let menus: Vec<Menu> = menus.into_iter().collect();
+    pub fn set_menus(&self, menus: Vec<Menu>) {
         self.platform.set_menus(menus, &self.keymap.borrow());
     }
 
@@ -2457,12 +2390,13 @@ impl AppContext for App {
             let entity = build_entity(&mut Context::new_context(cx, slot.downgrade()));
 
             cx.push_effect(Effect::EntityCreated {
-                entity: handle.into_any(),
+                entity: handle.clone().into_any(),
                 tid: TypeId::of::<T>(),
                 window: cx.window_update_stack.last().cloned(),
             });
 
-            cx.entities.insert(slot, entity)
+            cx.entities.insert(slot, entity);
+            handle
         })
     }
 
@@ -2757,6 +2691,13 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
         self.app.notify(lease.id);
         self.app.entities.end_lease(lease);
         self.app.finish_update();
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.foreground_executor.close();
+        self.background_executor.close();
     }
 }
 

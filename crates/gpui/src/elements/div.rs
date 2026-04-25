@@ -15,7 +15,6 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
-use crate::PinchEvent;
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, Hitbox,
@@ -27,7 +26,6 @@ use crate::{
     size,
 };
 use collections::HashMap;
-use gpui_util::ResultExt;
 use refineable::Refineable;
 use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
@@ -40,7 +38,7 @@ use std::{
     mem,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::ImageCacheProvider;
@@ -48,6 +46,8 @@ use super::ImageCacheProvider;
 const DRAG_THRESHOLD: f64 = 2.;
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
+const SCROLLBAR_AUTO_HIDE_DELAY: Duration = Duration::from_millis(2000);
+const SCROLLBAR_FADE_OUT_DURATION: Duration = Duration::from_millis(350);
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -354,35 +354,6 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to pinch gesture events during the bubble phase.
-    ///
-    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
-    pub fn on_pinch(&mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) {
-        self.pinch_listeners
-            .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                    (listener)(event, window, cx);
-                }
-            }));
-    }
-
-    /// Bind the given callback to pinch gesture events during the capture phase.
-    ///
-    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
-    pub fn capture_pinch(
-        &mut self,
-        listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static,
-    ) {
-        self.pinch_listeners
-            .push(Box::new(move |event, phase, _hitbox, window, cx| {
-                if phase == DispatchPhase::Capture {
-                    (listener)(event, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            }));
-    }
-
     /// Bind the given callback to an action dispatch during the capture phase.
     /// The imperative API equivalent to [`InteractiveElement::capture_action`].
     ///
@@ -665,10 +636,6 @@ impl Interactivity {
     pub fn block_mouse_except_scroll(&mut self) {
         self.hitbox_behavior = HitboxBehavior::BlockMouseExceptScroll;
     }
-
-    fn has_pinch_listeners(&self) -> bool {
-        !self.pinch_listeners.is_empty()
-    }
 }
 
 /// A trait for elements that want to use the standard GPUI event handlers that don't
@@ -738,10 +705,13 @@ pub trait InteractiveElement: Sized {
     fn key_context<C, E>(mut self, key_context: C) -> Self
     where
         C: TryInto<KeyContext, Error = E>,
-        E: std::fmt::Display,
+        E: Debug,
     {
-        if let Some(key_context) = key_context.try_into().log_err() {
-            self.interactivity().key_context = Some(key_context);
+        match key_context.try_into() {
+            Ok(key_context) => self.interactivity().key_context = Some(key_context),
+            Err(error) => {
+                log::error!("failed to build key context: {error:?}");
+            }
         }
         self
     }
@@ -939,26 +909,6 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to pinch gesture events during the bubble phase.
-    /// The fluent API equivalent to [`Interactivity::on_pinch`].
-    ///
-    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
-    fn on_pinch(mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) -> Self {
-        self.interactivity().on_pinch(listener);
-        self
-    }
-
-    /// Bind the given callback to pinch gesture events during the capture phase.
-    /// The fluent API equivalent to [`Interactivity::capture_pinch`].
-    ///
-    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
-    fn capture_pinch(
-        mut self,
-        listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.interactivity().capture_pinch(listener);
-        self
-    }
     /// Capture the given action, before normal action dispatch can fire.
     /// The fluent API equivalent to [`Interactivity::capture_action`].
     ///
@@ -1335,9 +1285,6 @@ pub(crate) type MouseMoveListener =
 pub(crate) type ScrollWheelListener =
     Box<dyn Fn(&ScrollWheelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
-pub(crate) type PinchListener =
-    Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
-
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type DragListener =
@@ -1692,7 +1639,6 @@ pub struct Interactivity {
     pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
-    pub(crate) pinch_listeners: Vec<PinchListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
     pub(crate) key_up_listeners: Vec<KeyUpListener>,
     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
@@ -1896,7 +1842,6 @@ impl Interactivity {
             || !self.click_listeners.is_empty()
             || !self.aux_click_listeners.is_empty()
             || !self.scroll_wheel_listeners.is_empty()
-            || self.has_pinch_listeners()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
             || self.tooltip_builder.is_some()
@@ -1936,18 +1881,18 @@ impl Interactivity {
             // high for the maximum scroll, we round the scroll max to 2 decimal
             // places here.
             let padded_content_size = self.content_size + padding_size;
-            let scroll_max = Point::from(padded_content_size - bounds.size)
+            let scroll_max = (padded_content_size - bounds.size)
                 .map(round_to_two_decimals)
                 .max(&Default::default());
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
 
-            scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
+            scroll_offset.x = scroll_offset.x.clamp(-scroll_max.width, px(0.));
             if scroll_to_bottom {
-                scroll_offset.y = -scroll_max.y;
+                scroll_offset.y = -scroll_max.height;
             } else {
-                scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
+                scroll_offset.y = scroll_offset.y.clamp(-scroll_max.height, px(0.));
             }
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
@@ -2055,6 +2000,14 @@ impl Interactivity {
 
                                         self.paint_keyboard_listeners(window, cx);
                                         f(&style, window, cx);
+                                        self.paint_scrollbars(
+                                            bounds,
+                                            &style,
+                                            hitbox,
+                                            element_state.as_mut(),
+                                            window,
+                                            cx,
+                                        );
 
                                         if let Some(_hitbox) = hitbox {
                                             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2259,13 +2212,6 @@ impl Interactivity {
         for listener in self.scroll_wheel_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                listener(event, phase, &hitbox, window, cx);
-            })
-        }
-
-        for listener in self.pinch_listeners.drain(..) {
-            let hitbox = hitbox.clone();
-            window.on_mouse_event(move |event: &PinchEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
         }
@@ -2554,8 +2500,7 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     let source_bounds = hitbox.bounds;
                     move |window: &Window| {
-                        !window.last_input_was_keyboard()
-                            && pending_mouse_down.borrow().is_none()
+                        pending_mouse_down.borrow().is_none()
                             && source_bounds.contains(&window.mouse_position())
                     }
                 });
@@ -2575,24 +2520,18 @@ impl Interactivity {
                 );
             }
 
-            // We unconditionally bind both the mouse up and mouse down active state handlers
-            // Because we might not get a chance to render a frame before the mouse up event arrives.
             let active_state = element_state
                 .clicked_state
                 .get_or_insert_with(Default::default)
                 .clone();
-
-            {
-                let active_state = active_state.clone();
+            if active_state.borrow().is_clicked() {
                 window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
+                    if phase == DispatchPhase::Capture {
                         *active_state.borrow_mut() = ElementClickedState::default();
                         window.refresh();
                     }
                 });
-            }
-
-            {
+            } else {
                 let active_group_hitbox = self
                     .group_active_style
                     .as_ref()
@@ -2716,6 +2655,445 @@ impl Interactivity {
                     }
                 }
             });
+        }
+    }
+
+    fn paint_scrollbars(
+        &self,
+        bounds: Bounds<Pixels>,
+        style: &Style,
+        hitbox: Option<&Hitbox>,
+        element_state: Option<&mut InteractiveElementState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let scrollbar_width = style.scrollbar_width.to_pixels(window.rem_size());
+        if scrollbar_width <= px(0.) {
+            return;
+        }
+
+        let Some(scroll_offset) = self.scroll_offset.as_ref() else {
+            return;
+        };
+
+        let offset = *scroll_offset.borrow();
+        let padding = style
+            .padding
+            .to_pixels(bounds.size.into(), window.rem_size());
+        let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+        let content_size = self.content_size + padding_size;
+        let max_offset = (content_size - bounds.size).max(&Default::default());
+
+        let (scrollbar_drag_state, scrollbar_visible_until, scrollbar_visibility_seq) =
+            if let Some(state) = element_state {
+                (
+                    Some(
+                        state
+                            .scrollbar_drag_state
+                            .get_or_insert_with(Default::default)
+                            .clone(),
+                    ),
+                    Some(
+                        state
+                            .scrollbar_visible_until
+                            .get_or_insert_with(Default::default)
+                            .clone(),
+                    ),
+                    Some(
+                        state
+                            .scrollbar_visibility_seq
+                            .get_or_insert_with(Default::default)
+                            .clone(),
+                    ),
+                )
+            } else {
+                (None, None, None)
+            };
+
+        if style.overflow.y == Overflow::Scroll
+            && max_offset.height > px(0.)
+            && bounds.size.height > px(0.)
+        {
+            let viewport_h = bounds.size.height;
+            let content_h = viewport_h + max_offset.height;
+            let thumb_h = ((viewport_h / content_h) * viewport_h)
+                .max(px(24.))
+                .min(viewport_h);
+            let travel = (viewport_h - thumb_h).max(px(0.));
+            let scrolled = (-offset.y).clamp(px(0.), max_offset.height);
+            let thumb_top = if max_offset.height <= px(0.) {
+                px(0.)
+            } else {
+                (scrolled / max_offset.height) * travel
+            };
+
+            let track_bounds = Bounds::new(
+                point(bounds.right() - scrollbar_width, bounds.top()),
+                size(scrollbar_width, viewport_h),
+            );
+            let thumb_bounds = Bounds::new(
+                point(track_bounds.left(), track_bounds.top() + thumb_top),
+                size(scrollbar_width, thumb_h),
+            );
+
+            if let (Some(hitbox), Some(scrollbar_drag_state)) =
+                (hitbox, scrollbar_drag_state.as_ref())
+            {
+                let hitbox_for_mouse_down = hitbox.clone();
+                let scrollbar_drag_state = scrollbar_drag_state.clone();
+                let scroll_offset = scroll_offset.clone();
+                let current_view = window.current_view();
+                let track_bounds_for_mouse_down = track_bounds;
+                let thumb_bounds_for_mouse_down = thumb_bounds;
+                let travel_for_mouse_down = travel;
+                let max_offset_height_for_mouse_down = max_offset.height;
+                let thumb_h_for_mouse_down = thumb_h;
+                let scrollbar_visible_until_for_mouse_down = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_mouse_down = scrollbar_visibility_seq.clone();
+
+                let scrollbar_drag_state_for_mouse_down = scrollbar_drag_state.clone();
+                let scroll_offset_for_mouse_down = scroll_offset.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || !hitbox_for_mouse_down.is_hovered(window) {
+                        return;
+                    }
+
+                    if !track_bounds_for_mouse_down.contains(&event.position) {
+                        return;
+                    }
+
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_mouse_down.as_ref(),
+                        scrollbar_visibility_seq_for_mouse_down.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() =
+                            Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+
+                    let mut drag_state = scrollbar_drag_state_for_mouse_down.borrow_mut();
+                    let mut offset = scroll_offset_for_mouse_down.borrow_mut();
+
+                    if thumb_bounds_for_mouse_down.contains(&event.position) {
+                        *drag_state = Some(ScrollbarDragState {
+                            grab_offset_y: event.position.y - thumb_bounds_for_mouse_down.top(),
+                        });
+                        cx.notify(current_view);
+                    } else {
+                        let thumb_top = (event.position.y
+                            - track_bounds_for_mouse_down.top()
+                            - thumb_h_for_mouse_down / 2.)
+                            .clamp(px(0.), travel_for_mouse_down);
+                        let percentage = if travel_for_mouse_down <= px(0.) {
+                            0.
+                        } else {
+                            thumb_top / travel_for_mouse_down
+                        };
+                        offset.y = -(percentage * max_offset_height_for_mouse_down);
+                        *drag_state = Some(ScrollbarDragState {
+                            grab_offset_y: thumb_h_for_mouse_down / 2.,
+                        });
+                        cx.notify(current_view);
+                    }
+
+                    cx.stop_propagation();
+                });
+
+                let scrollbar_drag_state_for_mouse_up = scrollbar_drag_state.clone();
+                let scrollbar_visible_until_for_mouse_up = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_mouse_up = scrollbar_visibility_seq.clone();
+                let current_view_for_mouse_up = current_view;
+                window.on_mouse_event(move |_: &MouseUpEvent, _phase, window, cx| {
+                    scrollbar_drag_state_for_mouse_up.borrow_mut().take();
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_mouse_up.as_ref(),
+                        scrollbar_visibility_seq_for_mouse_up.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() =
+                            Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view_for_mouse_up;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+                    cx.notify(current_view_for_mouse_up);
+                });
+
+                let scrollbar_drag_state_for_mouse_move = scrollbar_drag_state.clone();
+                let scroll_offset_for_mouse_move = scroll_offset.clone();
+                let scrollbar_visible_until_for_mouse_move = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_mouse_move = scrollbar_visibility_seq.clone();
+                let current_view = current_view;
+                let track_bounds_for_mouse_move = track_bounds;
+                let travel_for_mouse_move = travel;
+                let max_offset_height_for_mouse_move = max_offset.height;
+                window.on_mouse_event(move |event: &MouseMoveEvent, _phase, window, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+
+                    let Some(drag_state) = *scrollbar_drag_state_for_mouse_move.borrow() else {
+                        return;
+                    };
+
+                    let thumb_top = (event.position.y
+                        - track_bounds_for_mouse_move.top()
+                        - drag_state.grab_offset_y)
+                        .clamp(px(0.), travel_for_mouse_move);
+                    let percentage = if travel_for_mouse_move <= px(0.) {
+                        0.
+                    } else {
+                        thumb_top / travel_for_mouse_move
+                    };
+                    let mut offset = scroll_offset_for_mouse_move.borrow_mut();
+                    let next_offset_y = -(percentage * max_offset_height_for_mouse_move);
+                    if offset.y != next_offset_y {
+                        offset.y = next_offset_y;
+                        if let (Some(visible_until), Some(visibility_seq)) = (
+                            scrollbar_visible_until_for_mouse_move.as_ref(),
+                            scrollbar_visibility_seq_for_mouse_move.as_ref(),
+                        ) {
+                            *visible_until.borrow_mut() =
+                                Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                            let ticket = {
+                                let mut seq = visibility_seq.borrow_mut();
+                                *seq += 1;
+                                *seq
+                            };
+                            let visibility_seq = visibility_seq.clone();
+                            let current_view = current_view;
+                            window
+                                .spawn(cx, async move |cx| {
+                                    cx.background_executor()
+                                        .timer(
+                                            SCROLLBAR_AUTO_HIDE_DELAY
+                                                .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                        )
+                                        .await;
+                                    if *visibility_seq.borrow() == ticket {
+                                        cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                    }
+                                    cx.background_executor()
+                                        .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                        .await;
+                                    if *visibility_seq.borrow() == ticket {
+                                        cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                    }
+                                })
+                                .detach();
+                        }
+                        cx.notify(current_view);
+                    }
+                });
+
+                let hitbox_for_scroll_wheel = hitbox.clone();
+                let scrollbar_visible_until_for_scroll_wheel = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_scroll_wheel = scrollbar_visibility_seq.clone();
+                let current_view_for_scroll_wheel = current_view;
+                window.on_mouse_event(move |_event: &ScrollWheelEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || !hitbox_for_scroll_wheel.should_handle_scroll(window)
+                    {
+                        return;
+                    }
+
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_scroll_wheel.as_ref(),
+                        scrollbar_visibility_seq_for_scroll_wheel.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() =
+                            Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view_for_scroll_wheel;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+                });
+
+                let hitbox_for_hover = hitbox.clone();
+                let scrollbar_visible_until_for_hover = scrollbar_visible_until.clone();
+                let scrollbar_visibility_seq_for_hover = scrollbar_visibility_seq.clone();
+                let current_view_for_hover = current_view;
+                let track_bounds_for_hover = track_bounds;
+                let thumb_bounds_for_hover = thumb_bounds;
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || !hitbox_for_hover.is_hovered(window) {
+                        return;
+                    }
+
+                    if !track_bounds_for_hover.contains(&event.position)
+                        && !thumb_bounds_for_hover.contains(&event.position)
+                    {
+                        return;
+                    }
+
+                    if let (Some(visible_until), Some(visibility_seq)) = (
+                        scrollbar_visible_until_for_hover.as_ref(),
+                        scrollbar_visibility_seq_for_hover.as_ref(),
+                    ) {
+                        *visible_until.borrow_mut() =
+                            Some(Instant::now() + SCROLLBAR_AUTO_HIDE_DELAY);
+                        let ticket = {
+                            let mut seq = visibility_seq.borrow_mut();
+                            *seq += 1;
+                            *seq
+                        };
+                        let visibility_seq = visibility_seq.clone();
+                        let current_view = current_view_for_hover;
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor()
+                                    .timer(
+                                        SCROLLBAR_AUTO_HIDE_DELAY
+                                            .saturating_sub(SCROLLBAR_FADE_OUT_DURATION),
+                                    )
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                                cx.background_executor()
+                                    .timer(SCROLLBAR_FADE_OUT_DURATION)
+                                    .await;
+                                if *visibility_seq.borrow() == ticket {
+                                    cx.update(|_window, cx| cx.notify(current_view)).ok();
+                                }
+                            })
+                            .detach();
+                    }
+                });
+            }
+
+            let dragging = scrollbar_drag_state
+                .as_ref()
+                .is_some_and(|state| state.borrow().is_some());
+            let visible_until = scrollbar_visible_until
+                .as_ref()
+                .and_then(|visible_until| *visible_until.borrow());
+            let now = Instant::now();
+            let fade_factor = if cx.should_auto_hide_scrollbars() {
+                if dragging {
+                    1.0
+                } else if let Some(until) = visible_until {
+                    if until <= now {
+                        return;
+                    }
+                    let remaining = until.saturating_duration_since(now);
+                    if remaining <= SCROLLBAR_FADE_OUT_DURATION {
+                        window.refresh();
+                        (remaining.as_secs_f32() / SCROLLBAR_FADE_OUT_DURATION.as_secs_f32())
+                            .clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    }
+                } else {
+                    return;
+                }
+            } else {
+                1.0
+            };
+
+            let mouse_position = window.mouse_position();
+            let track_hovered = track_bounds.contains(&mouse_position);
+            let thumb_hovered = thumb_bounds.contains(&mouse_position);
+
+            let (mut track_color, mut thumb_color) = if dragging {
+                (crate::rgba(0xA1A1AA5C), crate::rgba(0xE4E4E7FF))
+            } else if thumb_hovered {
+                (crate::rgba(0xA1A1AA40), crate::rgba(0xD4D4D8F0))
+            } else if track_hovered {
+                (crate::rgba(0xA1A1AA38), crate::rgba(0xB4B4BBDE))
+            } else {
+                (crate::rgba(0xA1A1AA28), crate::rgba(0xA1A1AAD0))
+            };
+            track_color.a *= fade_factor;
+            thumb_color.a *= fade_factor;
+
+            let radius = scrollbar_width / 2.;
+            window.paint_quad(crate::quad(
+                track_bounds,
+                radius,
+                track_color,
+                px(0.),
+                crate::transparent_black(),
+                crate::BorderStyle::default(),
+            ));
+            window.paint_quad(crate::quad(
+                thumb_bounds,
+                radius,
+                thumb_color,
+                px(0.),
+                crate::transparent_black(),
+                crate::BorderStyle::default(),
+            ));
         }
     }
 
@@ -2869,7 +3247,15 @@ pub struct InteractiveElementState {
     pub(crate) hover_listener_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) scrollbar_drag_state: Option<Rc<RefCell<Option<ScrollbarDragState>>>>,
+    pub(crate) scrollbar_visible_until: Option<Rc<RefCell<Option<Instant>>>>,
+    pub(crate) scrollbar_visibility_seq: Option<Rc<RefCell<u64>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollbarDragState {
+    grab_offset_y: Pixels,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -3058,29 +3444,21 @@ fn handle_tooltip_mouse_move(
         }
         Action::ScheduleShow => {
             let delayed_show_task = window.spawn(cx, {
-                let weak_active_tooltip = Rc::downgrade(active_tooltip);
+                let active_tooltip = active_tooltip.clone();
                 let build_tooltip = build_tooltip.clone();
                 let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
                 async move |cx| {
                     cx.background_executor().timer(TOOLTIP_SHOW_DELAY).await;
-                    let Some(active_tooltip) = weak_active_tooltip.upgrade() else {
-                        return;
-                    };
                     cx.update(|window, cx| {
                         let new_tooltip =
                             build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
-                                let weak_active_tooltip = Rc::downgrade(&active_tooltip);
+                                let active_tooltip = active_tooltip.clone();
                                 ActiveTooltip::Visible {
                                     tooltip: AnyTooltip {
                                         view,
                                         mouse_position: window.mouse_position(),
                                         check_visible_and_update: Rc::new(
                                             move |tooltip_bounds, window, cx| {
-                                                let Some(active_tooltip) =
-                                                    weak_active_tooltip.upgrade()
-                                                else {
-                                                    return false;
-                                                };
                                                 handle_tooltip_check_visible_and_update(
                                                     &active_tooltip,
                                                     tooltip_is_hoverable,
@@ -3159,14 +3537,11 @@ fn handle_tooltip_check_visible_and_update(
         Action::Hide => clear_active_tooltip(active_tooltip, window),
         Action::ScheduleHide(tooltip) => {
             let delayed_hide_task = window.spawn(cx, {
-                let weak_active_tooltip = Rc::downgrade(active_tooltip);
+                let active_tooltip = active_tooltip.clone();
                 async move |cx| {
                     cx.background_executor()
                         .timer(HOVERABLE_TOOLTIP_HIDE_DELAY)
                         .await;
-                    let Some(active_tooltip) = weak_active_tooltip.upgrade() else {
-                        return;
-                    };
                     if active_tooltip.borrow_mut().take().is_some() {
                         cx.update(|window, _cx| window.refresh()).ok();
                     }
@@ -3360,7 +3735,7 @@ impl ScrollAnchor {
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
     bounds: Bounds<Pixels>,
-    max_offset: Point<Pixels>,
+    max_offset: Size<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
@@ -3404,7 +3779,7 @@ impl ScrollHandle {
     }
 
     /// Get the maximum scroll offset.
-    pub fn max_offset(&self) -> Point<Pixels> {
+    pub fn max_offset(&self) -> Size<Pixels> {
         self.0.borrow().max_offset
     }
 
@@ -3579,112 +3954,6 @@ impl ScrollHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppContext as _, Context, InputEvent, MouseMoveEvent, TestAppContext};
-    use std::rc::Weak;
-
-    struct TestTooltipView;
-
-    impl Render for TestTooltipView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(20.)).h(px(20.)).child("tooltip")
-        }
-    }
-
-    type CapturedActiveTooltip = Rc<RefCell<Option<Weak<RefCell<Option<ActiveTooltip>>>>>>;
-
-    struct TooltipCaptureElement {
-        child: AnyElement,
-        captured_active_tooltip: CapturedActiveTooltip,
-    }
-
-    impl IntoElement for TooltipCaptureElement {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
-
-    impl Element for TooltipCaptureElement {
-        type RequestLayoutState = ();
-        type PrepaintState = ();
-
-        fn id(&self) -> Option<ElementId> {
-            None
-        }
-
-        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-            None
-        }
-
-        fn request_layout(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> (LayoutId, Self::RequestLayoutState) {
-            (self.child.request_layout(window, cx), ())
-        }
-
-        fn prepaint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> Self::PrepaintState {
-            self.child.prepaint(window, cx);
-        }
-
-        fn paint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            _prepaint: &mut Self::PrepaintState,
-            window: &mut Window,
-            cx: &mut App,
-        ) {
-            self.child.paint(window, cx);
-            window.with_global_id("target".into(), |global_id, window| {
-                window.with_element_state::<InteractiveElementState, _>(
-                    global_id,
-                    |state, _window| {
-                        let state = state.unwrap();
-                        *self.captured_active_tooltip.borrow_mut() =
-                            state.active_tooltip.as_ref().map(Rc::downgrade);
-                        ((), state)
-                    },
-                )
-            });
-        }
-    }
-
-    struct TooltipOwner {
-        captured_active_tooltip: CapturedActiveTooltip,
-    }
-
-    impl Render for TooltipOwner {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            TooltipCaptureElement {
-                child: div()
-                    .size_full()
-                    .child(
-                        div()
-                            .id("target")
-                            .w(px(50.))
-                            .h(px(50.))
-                            .tooltip(|_, cx| cx.new(|_| TestTooltipView).into()),
-                    )
-                    .into_any_element(),
-                captured_active_tooltip: self.captured_active_tooltip.clone(),
-            }
-        }
-    }
 
     #[test]
     fn scroll_handle_aligns_wide_children_to_left_edge() {
@@ -3722,97 +3991,5 @@ mod tests {
         handle.scroll_to_active_item();
 
         assert_eq!(handle.offset().y, px(-25.));
-    }
-
-    fn setup_tooltip_owner_test() -> (
-        TestAppContext,
-        crate::AnyWindowHandle,
-        CapturedActiveTooltip,
-    ) {
-        let mut test_app = TestAppContext::single();
-        let captured_active_tooltip: CapturedActiveTooltip = Rc::new(RefCell::new(None));
-        let window = test_app.add_window({
-            let captured_active_tooltip = captured_active_tooltip.clone();
-            move |_, _| TooltipOwner {
-                captured_active_tooltip,
-            }
-        });
-        let any_window = window.into();
-
-        test_app
-            .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear();
-            })
-            .unwrap();
-
-        test_app
-            .update_window(any_window, |_, window, cx| {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: point(px(10.), px(10.)),
-                        modifiers: Default::default(),
-                        pressed_button: None,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-            })
-            .unwrap();
-
-        test_app
-            .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear();
-            })
-            .unwrap();
-
-        (test_app, any_window, captured_active_tooltip)
-    }
-
-    #[test]
-    fn tooltip_waiting_for_show_is_released_when_its_owner_disappears() {
-        let (mut test_app, any_window, captured_active_tooltip) = setup_tooltip_owner_test();
-
-        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
-        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
-        assert!(matches!(
-            active_tooltip.borrow().as_ref(),
-            Some(ActiveTooltip::WaitingForShow { .. })
-        ));
-
-        test_app
-            .update_window(any_window, |_, window, _| {
-                window.remove_window();
-            })
-            .unwrap();
-        test_app.run_until_parked();
-        drop(active_tooltip);
-
-        assert!(weak_active_tooltip.upgrade().is_none());
-    }
-
-    #[test]
-    fn tooltip_is_released_when_its_owner_disappears() {
-        let (mut test_app, any_window, captured_active_tooltip) = setup_tooltip_owner_test();
-
-        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
-        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
-
-        test_app.dispatcher.advance_clock(TOOLTIP_SHOW_DELAY);
-        test_app.run_until_parked();
-
-        assert!(matches!(
-            active_tooltip.borrow().as_ref(),
-            Some(ActiveTooltip::Visible { .. })
-        ));
-
-        test_app
-            .update_window(any_window, |_, window, _| {
-                window.remove_window();
-            })
-            .unwrap();
-        test_app.run_until_parked();
-        drop(active_tooltip);
-
-        assert!(weak_active_tooltip.upgrade().is_none());
     }
 }

@@ -67,6 +67,10 @@ pub(crate) struct EntityRefCounts {
     leak_detector: LeakDetector,
 }
 
+#[doc(hidden)]
+#[allow(dead_code)]
+pub struct EntityRefCountsDropHandle(Arc<RwLock<EntityRefCounts>>);
+
 impl EntityMap {
     pub fn new() -> Self {
         Self {
@@ -85,8 +89,8 @@ impl EntityMap {
     }
 
     #[doc(hidden)]
-    pub fn ref_counts_drop_handle(&self) -> Arc<RwLock<EntityRefCounts>> {
-        self.ref_counts.clone()
+    pub fn ref_counts_drop_handle(&self) -> EntityRefCountsDropHandle {
+        EntityRefCountsDropHandle(self.ref_counts.clone())
     }
 
     /// Captures a snapshot of all entities that currently have alive handles.

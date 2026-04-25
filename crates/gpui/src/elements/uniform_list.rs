@@ -5,9 +5,9 @@
 //! elements with uniform height.
 
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
-    GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
+    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId,
+    Entity, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity,
+    IntoElement, IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
     StyleRefinement, Styled, Window, point, px, size,
 };
 use smallvec::SmallVec;
@@ -241,11 +241,21 @@ impl UniformListScrollHandle {
     pub fn is_scrolled_to_end(&self) -> Option<bool> {
         let state = self.0.borrow();
         let max_offset = state.base_handle.max_offset();
-        if max_offset.y <= px(0.) {
+        if max_offset.height <= px(0.) {
             return None;
         }
         let offset = state.base_handle.offset();
-        Some(-offset.y >= max_offset.y)
+        Some(-offset.y >= max_offset.height)
+    }
+
+    /// Get the current scroll offset of the underlying list viewport.
+    pub fn offset(&self) -> Point<Pixels> {
+        self.0.borrow().base_handle.offset()
+    }
+
+    /// Get the maximum scroll offset of the underlying list viewport.
+    pub fn max_offset(&self) -> Size<Pixels> {
+        self.0.borrow().base_handle.max_offset()
     }
 
     /// Scroll to the bottom of the list.
@@ -683,6 +693,14 @@ impl UniformList {
     pub fn track_scroll(mut self, handle: &UniformListScrollHandle) -> Self {
         self.interactivity.tracked_scroll_handle = Some(handle.0.borrow().base_handle.clone());
         self.scroll_handle = Some(handle.clone());
+        self
+    }
+
+    /// Set the space to be reserved for rendering the scrollbar.
+    ///
+    /// This only affects layout when the list is scrollable.
+    pub fn scrollbar_width(mut self, width: impl Into<AbsoluteLength>) -> Self {
+        self.interactivity.base_style.scrollbar_width = Some(width.into());
         self
     }
 

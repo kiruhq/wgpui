@@ -1,6 +1,6 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
-    Style, Window, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, Length, Pixels, Point, Size, Style, Window,
+    size,
     util::{
         ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
         round_to_device_pixel,
@@ -12,7 +12,7 @@ use std::{fmt::Debug, ops::Range};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
-    prelude::{max_content, min_content},
+    prelude::min_content,
     style::AvailableSpace as TaffyAvailableSpace,
     tree::NodeId,
 };
@@ -425,34 +425,19 @@ impl ToTaffy<taffy::style::Style> for Style {
         }
 
         fn to_grid_repeat<T: taffy::style::CheapCloneStr>(
-            unit: &Option<GridTemplate>,
+            unit: &Option<u16>,
         ) -> Vec<taffy::GridTemplateComponent<T>> {
-            unit.map(|template| {
-                match template.min_size {
-                    // grid-template-*: repeat(<number>, minmax(0, 1fr));
-                    crate::TemplateColumnMinSize::Zero => {
-                        vec![repeat(
-                            template.repeat,
-                            vec![minmax(length(0.0_f32), fr(1.0_f32))],
-                        )]
-                    }
-                    // grid-template-*: repeat(<number>, minmax(min-content, 1fr));
-                    crate::TemplateColumnMinSize::MinContent => {
-                        vec![repeat(
-                            template.repeat,
-                            vec![minmax(min_content(), fr(1.0_f32))],
-                        )]
-                    }
-                    // grid-template-*: repeat(<number>, minmax(0, max-content))
-                    crate::TemplateColumnMinSize::MaxContent => {
-                        vec![repeat(
-                            template.repeat,
-                            vec![minmax(length(0.0_f32), max_content())],
-                        )]
-                    }
-                }
-            })
-            .unwrap_or_default()
+            // grid-template-columns: repeat(<number>, minmax(0, 1fr));
+            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0), fr(1.0))])])
+                .unwrap_or_default()
+        }
+
+        fn to_grid_repeat_min_content<T: taffy::style::CheapCloneStr>(
+            unit: &Option<u16>,
+        ) -> Vec<taffy::GridTemplateComponent<T>> {
+            // grid-template-columns: repeat(<number>, minmax(min-content, 1fr));
+            unit.map(|count| vec![repeat(count, vec![minmax(min_content(), fr(1.0))])])
+                .unwrap_or_default()
         }
 
         taffy::style::Style {
@@ -479,7 +464,11 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
             grid_template_rows: to_grid_repeat(&self.grid_rows),
-            grid_template_columns: to_grid_repeat(&self.grid_cols),
+            grid_template_columns: if self.grid_cols_min_content.is_some() {
+                to_grid_repeat_min_content(&self.grid_cols_min_content)
+            } else {
+                to_grid_repeat(&self.grid_cols)
+            },
             grid_row: self
                 .grid_location
                 .as_ref()
