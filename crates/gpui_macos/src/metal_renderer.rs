@@ -835,6 +835,7 @@ impl MetalRenderer {
                         viewport_size,
                         command_encoder,
                     ),
+                PrimitiveBatch::ShaderSurfaces(_) => true,
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range],
                     instance_buffer,
@@ -1469,7 +1470,7 @@ impl MetalRenderer {
                     buffer_contents,
                     SurfaceBounds {
                         bounds: surface.bounds,
-                        content_mask: surface.content_mask,
+                        content_mask: surface.content_mask.clone(),
                     },
                 );
             }

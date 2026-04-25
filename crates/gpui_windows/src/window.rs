@@ -20,15 +20,12 @@ use windows::{
         Foundation::*,
         Graphics::Dwm::*,
         Graphics::Gdi::*,
-        System::{
-            Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
-        },
+        System::{Com::*, LibraryLoader::*, Ole::*, SystemServices::*},
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
     core::*,
 };
 
-use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
 use gpui::*;
 
@@ -60,20 +57,12 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
-    pub direct_manipulation: DirectManipulationHandler,
 
-    pub renderer: RefCell<DirectXRenderer>,
-    /// Set after a GPU device-lost recovery so the next `draw_window` call is
-    /// treated as a forced render. This guarantees the next frame both
-    /// re-enables drawing (via `mark_drawable`) and bypasses the GPUI view
-    /// cache, which would otherwise replay stale atlas tile references from
-    /// the previous frame and panic in `DirectXAtlasState::texture`.
-    pub force_render_after_recovery: Cell<bool>,
+    pub renderer: RefCell<wgpu_renderer::Renderer>,
+    pub wgpu_context: wgpu_renderer::Context,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
-    /// Shared with [`WindowsPlatformState::cursor_visible`].
-    pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
 
     pub display: Cell<WindowsDisplay>,
@@ -103,14 +92,13 @@ pub(crate) struct WindowsWindowInner {
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
-        directx_devices: &DirectXDevices,
+        _directx_devices: &DirectXDevices,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
-        cursor_visible: Arc<AtomicBool>,
         display: WindowsDisplay,
         min_size: Option<Size<Pixels>>,
         appearance: WindowAppearance,
-        disable_direct_composition: bool,
+        _disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
     ) -> Result<Self> {
         let scale_factor = {
@@ -131,8 +119,13 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let wgpu_context: wgpu_renderer::Context = Rc::new(RefCell::new(None));
+        let renderer = wgpu_renderer::new_renderer(
+            wgpu_context.clone(),
+            hwnd,
+            logical_size.map(|p| p.as_f32()),
+            false,
+        );
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -143,9 +136,6 @@ impl WindowsWindowState {
         let nc_button_pressed = None;
         let fullscreen = None;
         let initial_placement = None;
-
-        let direct_manipulation = DirectManipulationHandler::new(hwnd, scale_factor)
-            .context("initializing Direct Manipulation")?;
 
         Ok(Self {
             origin: Cell::new(origin),
@@ -165,17 +155,15 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
-            force_render_after_recovery: Cell::new(false),
+            wgpu_context,
             click_state,
             current_cursor: Cell::new(current_cursor),
-            cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
             hwnd,
             invalidate_devices,
-            direct_manipulation,
         })
     }
 
@@ -245,7 +233,6 @@ impl WindowsWindowInner {
             &context.directx_devices,
             cs,
             context.current_cursor,
-            context.cursor_visible.clone(),
             context.display,
             context.min_size,
             context.appearance,
@@ -385,7 +372,6 @@ struct WindowCreateContext {
     min_size: Option<Size<Pixels>>,
     executor: ForegroundExecutor,
     current_cursor: Option<HCURSOR>,
-    cursor_visible: Arc<AtomicBool>,
     drop_target_helper: IDropTargetHelper,
     validation_number: usize,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
@@ -407,7 +393,6 @@ impl WindowsWindow {
             icon,
             executor,
             current_cursor,
-            cursor_visible,
             drop_target_helper,
             validation_number,
             main_receiver,
@@ -466,18 +451,19 @@ impl WindowsWindow {
 
             (dwexstyle, dwstyle)
         };
-        if !disable_direct_composition {
-            dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
-        }
+        // WS_EX_NOREDIRECTIONBITMAP is only needed for DirectComposition.
+        // With the wgpu renderer, the swap chain presents directly to the window.
+        // if !disable_direct_composition {
+        //     dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
+        // }
 
         let hinstance = get_module_handle();
         let display = if let Some(display_id) = params.display_id {
-            WindowsDisplay::new(display_id)
+            // if we obtain a display_id, then this ID must be valid.
+            WindowsDisplay::new(display_id).unwrap()
         } else {
-            None
-        }
-        .or_else(WindowsDisplay::primary_monitor)
-        .context("failed to find any monitor")?;
+            WindowsDisplay::primary_monitor().unwrap()
+        };
         let appearance = system_appearance().unwrap_or_default();
         let mut context = WindowCreateContext {
             inner: None,
@@ -488,7 +474,6 @@ impl WindowsWindow {
             min_size: params.window_min_size,
             executor,
             current_cursor,
-            cursor_visible,
             drop_target_helper,
             validation_number,
             main_receiver,
@@ -556,9 +541,10 @@ impl rwh::HasWindowHandle for WindowsWindow {
     }
 }
 
+// todo(windows)
 impl rwh::HasDisplayHandle for WindowsWindow {
     fn display_handle(&self) -> std::result::Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        Ok(rwh::DisplayHandle::windows())
+        unimplemented!()
     }
 }
 
@@ -966,11 +952,6 @@ impl PlatformWindow for WindowsWindow {
         };
 
         self.0.update_ime_position(self.0.hwnd, caret_position);
-    }
-
-    fn play_system_bell(&self) {
-        // MB_OK: The sound specified as the Windows Default Beep sound.
-        let _ = unsafe { MessageBeep(MB_OK) };
     }
 }
 

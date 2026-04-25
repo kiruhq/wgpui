@@ -1,17 +1,25 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite,
+    PaintShaderSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    ShaderSurfaceDraw, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::any::{Any, TypeId};
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+pub type RenderPrimitiveNv12BytesProvider =
+    Arc<dyn Fn(&mut dyn FnMut(&[u8])) -> bool + Send + Sync>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -75,10 +83,928 @@ pub struct WgpuSurfaceConfig {
     /// Preferred presentation mode. When `Some`, the renderer will use this
     /// mode if supported by the surface, falling back to `Fifo`.
     /// When `None`, defaults to `Fifo` (VSync).
-    ///
-    /// Mobile platforms may prefer `Mailbox` (triple-buffering) to avoid
-    /// blocking in `get_current_texture()` during lifecycle transitions.
     pub preferred_present_mode: Option<wgpu::PresentMode>,
+}
+
+/// Shared GPU context reference, used to coordinate device recovery across multiple windows.
+pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
+
+const DEFAULT_CUSTOM_SHADER_WGSL: &str = r#"
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0)
+    );
+    let xy = positions[vertex_index];
+    return vec4<f32>(xy, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+}
+"#;
+
+pub struct CustomShaderDescriptor<'a> {
+    pub label: Option<&'a str>,
+    pub shader_source: &'a str,
+    pub vertex_entry: &'a str,
+    pub fragment_entry: &'a str,
+    pub primitive_topology: wgpu::PrimitiveTopology,
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub uniform_bytes: Option<&'a [u8]>,
+    pub blend_state: Option<wgpu::BlendState>,
+    pub texture_mode: CustomShaderTextureMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CustomShaderTextureMode {
+    #[default]
+    None,
+    VideoPlayerFull,
+}
+
+#[derive(Clone)]
+pub struct GlobalCustomShaderConfig {
+    pub label: Option<String>,
+    pub shader_source: String,
+    pub vertex_entry: String,
+    pub fragment_entry: String,
+    pub primitive_topology: wgpu::PrimitiveTopology,
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub uniform_bytes: Option<Vec<u8>>,
+    pub blend_state: Option<wgpu::BlendState>,
+    pub animate_uniforms_with_time: bool,
+    pub texture_mode: CustomShaderTextureMode,
+}
+
+impl Default for GlobalCustomShaderConfig {
+    fn default() -> Self {
+        Self {
+            label: Some("gpui_custom_shader".to_string()),
+            shader_source: DEFAULT_CUSTOM_SHADER_WGSL.to_string(),
+            vertex_entry: "vs_main".to_string(),
+            fragment_entry: "fs_main".to_string(),
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            vertex_count: 3,
+            instance_count: 1,
+            uniform_bytes: None,
+            blend_state: None,
+            animate_uniforms_with_time: false,
+            texture_mode: CustomShaderTextureMode::None,
+        }
+    }
+}
+
+static GLOBAL_CUSTOM_SHADER_CONFIG: OnceLock<Mutex<Option<GlobalCustomShaderConfig>>> =
+    OnceLock::new();
+static GLOBAL_CUSTOM_SHADER_RUNTIME: OnceLock<Mutex<GlobalCustomShaderRuntime>> = OnceLock::new();
+static NAMED_CUSTOM_SHADER_CONFIGS: OnceLock<Mutex<HashMap<String, GlobalCustomShaderConfig>>> =
+    OnceLock::new();
+static SHADER_SURFACE_DRAWS: OnceLock<Mutex<Vec<ShaderSurfaceDraw>>> = OnceLock::new();
+static LAST_SHADER_SURFACE_DRAWS: OnceLock<Mutex<Vec<ShaderSurfaceDraw>>> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES: OnceLock<Mutex<HashMap<String, ShaderSurfaceTextureData>>> =
+    OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_NV12: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTexturePairData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE3D_UPDATES: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTexture3dData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_CAPTION: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTextureData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_RGBA_VIDEO: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTextureData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_BROLL: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTextureData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_BROLL_NV12: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTexturePairData>>,
+> = OnceLock::new();
+static SHADER_SURFACE_TEXTURE_UPDATES_BROLL_LUT3D: OnceLock<
+    Mutex<HashMap<String, ShaderSurfaceTexture3dData>>,
+> = OnceLock::new();
+static PRIMITIVE_PIPELINES: OnceLock<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>> =
+    OnceLock::new();
+static PRIMITIVE_RENDER_CONTEXT: OnceLock<Mutex<Option<PrimitiveRenderContext>>> = OnceLock::new();
+
+fn global_custom_shader_config() -> &'static Mutex<Option<GlobalCustomShaderConfig>> {
+    GLOBAL_CUSTOM_SHADER_CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Clone)]
+struct GlobalCustomShaderRuntime {
+    enabled: bool,
+    paused: bool,
+    time_scale: f32,
+    uniform_bytes: Option<Vec<u8>>,
+}
+
+impl Default for GlobalCustomShaderRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paused: false,
+            time_scale: 1.0,
+            uniform_bytes: None,
+        }
+    }
+}
+
+fn global_custom_shader_runtime() -> &'static Mutex<GlobalCustomShaderRuntime> {
+    GLOBAL_CUSTOM_SHADER_RUNTIME.get_or_init(|| Mutex::new(GlobalCustomShaderRuntime::default()))
+}
+
+fn named_custom_shader_configs() -> &'static Mutex<HashMap<String, GlobalCustomShaderConfig>> {
+    NAMED_CUSTOM_SHADER_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_draws() -> &'static Mutex<Vec<ShaderSurfaceDraw>> {
+    SHADER_SURFACE_DRAWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn render_primitive_texture_updates() -> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_updates_pair()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTexturePairData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_NV12.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_3d_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTexture3dData>> {
+    SHADER_SURFACE_TEXTURE3D_UPDATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_caption_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_CAPTION.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_rgba_video_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_RGBA_VIDEO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_broll_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTextureData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_BROLL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_broll_nv12_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTexturePairData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_BROLL_NV12.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn render_primitive_texture_broll_lut3d_updates()
+-> &'static Mutex<HashMap<String, ShaderSurfaceTexture3dData>> {
+    SHADER_SURFACE_TEXTURE_UPDATES_BROLL_LUT3D.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn primitive_pipelines() -> &'static Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>> {
+    PRIMITIVE_PIPELINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone)]
+struct PrimitiveRenderContext {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    format: wgpu::TextureFormat,
+}
+
+fn primitive_render_context() -> &'static Mutex<Option<PrimitiveRenderContext>> {
+    PRIMITIVE_RENDER_CONTEXT.get_or_init(|| Mutex::new(None))
+}
+
+fn set_primitive_render_context(
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    format: wgpu::TextureFormat,
+) {
+    if let Ok(mut slot) = primitive_render_context().lock() {
+        *slot = Some(PrimitiveRenderContext {
+            device,
+            queue,
+            format,
+        });
+    }
+}
+
+/// Get the shared wgpu device for creating textures outside the renderer.
+/// Available after the first renderer is initialized.
+pub fn shared_wgpu_device() -> Option<Arc<wgpu::Device>> {
+    primitive_render_context()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|ctx| Arc::clone(&ctx.device)))
+}
+
+fn last_render_primitive_draws() -> &'static Mutex<Vec<ShaderSurfaceDraw>> {
+    LAST_SHADER_SURFACE_DRAWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn take_render_primitive_draws() -> Vec<ShaderSurfaceDraw> {
+    let draws = render_primitive_draws()
+        .lock()
+        .map(|mut draws| std::mem::take(&mut *draws))
+        .unwrap_or_default();
+
+    if draws.is_empty() {
+        // No new draws were queued (present-only frame without a draw pass).
+        // Reuse the previous frame's draws to avoid a black flash.
+        return last_render_primitive_draws()
+            .lock()
+            .map(|last| last.clone())
+            .unwrap_or_default();
+    }
+
+    // Stash a copy for potential reuse on the next present-only frame.
+    if let Ok(mut last) = last_render_primitive_draws().lock() {
+        *last = draws.clone();
+    }
+
+    draws
+}
+
+fn take_render_primitive_texture_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_updates_pair() -> HashMap<String, ShaderSurfaceTexturePairData> {
+    render_primitive_texture_updates_pair()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_3d_updates() -> HashMap<String, ShaderSurfaceTexture3dData> {
+    render_primitive_texture_3d_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_caption_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_caption_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_rgba_video_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_rgba_video_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_broll_updates() -> HashMap<String, ShaderSurfaceTextureData> {
+    render_primitive_texture_broll_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_broll_nv12_updates()
+-> HashMap<String, ShaderSurfaceTexturePairData> {
+    render_primitive_texture_broll_nv12_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+fn take_render_primitive_texture_broll_lut3d_updates() -> HashMap<String, ShaderSurfaceTexture3dData>
+{
+    render_primitive_texture_broll_lut3d_updates()
+        .lock()
+        .map(|mut updates| std::mem::take(&mut *updates))
+        .unwrap_or_default()
+}
+
+pub fn set_global_custom_shader(config: Option<GlobalCustomShaderConfig>) {
+    if let Ok(mut slot) = global_custom_shader_config().lock() {
+        *slot = config;
+    }
+}
+
+pub fn set_global_custom_shader_enabled(enabled: bool) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.enabled = enabled;
+    }
+}
+
+pub fn set_global_custom_shader_paused(paused: bool) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.paused = paused;
+    }
+}
+
+pub fn set_global_custom_shader_time_scale(time_scale: f32) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.time_scale = time_scale.max(0.0);
+    }
+}
+
+pub fn set_global_custom_shader_uniform_bytes(uniform_bytes: Option<Vec<u8>>) {
+    if let Ok(mut runtime) = global_custom_shader_runtime().lock() {
+        runtime.uniform_bytes = uniform_bytes;
+    }
+}
+
+pub fn register_named_custom_shader(
+    shader_key: impl Into<String>,
+    config: GlobalCustomShaderConfig,
+) {
+    if let Ok(mut configs) = named_custom_shader_configs().lock() {
+        configs.insert(shader_key.into(), config);
+    }
+}
+
+pub fn unregister_named_custom_shader(shader_key: &str) {
+    if let Ok(mut configs) = named_custom_shader_configs().lock() {
+        configs.remove(shader_key);
+    }
+}
+
+fn queue_render_primitive_draw(draw: ShaderSurfaceDraw) {
+    if let Ok(mut draws) = render_primitive_draws().lock() {
+        draws.push(draw);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShaderSurfaceTextureFormat {
+    Bgra8Unorm,
+    Rgba8Unorm,
+}
+
+#[derive(Clone, Debug)]
+struct ShaderSurfaceTextureData {
+    pub key: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+    pub format: ShaderSurfaceTextureFormat,
+}
+
+#[derive(Clone, Debug)]
+struct ShaderSurfaceTexturePairData {
+    pub key: String,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub data: RenderPrimitiveTexturePairData,
+}
+
+#[derive(Clone, Debug)]
+struct ShaderSurfaceTexture3dData {
+    pub key: String,
+    pub size: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderPrimitiveTexture2d {
+    pub binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+    pub format: ShaderSurfaceTextureFormat,
+}
+
+impl RenderPrimitiveTexture2d {
+    pub fn new(
+        binding: u32,
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+        format: ShaderSurfaceTextureFormat,
+    ) -> Self {
+        Self {
+            binding,
+            width,
+            height,
+            bytes,
+            format,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum RenderPrimitiveTexturePairData {
+    Owned(Vec<u8>),
+    Lazy(RenderPrimitiveNv12BytesProvider),
+    /// Pre-imported GPU textures (zero-copy from IOSurface/Metal).
+    /// The textures are already on the GPU — no write_texture needed.
+    HalImported {
+        y_texture: Arc<wgpu::Texture>,
+        y_view: Arc<wgpu::TextureView>,
+        uv_texture: Arc<wgpu::Texture>,
+        uv_view: Arc<wgpu::TextureView>,
+        source_keeper: Arc<dyn Any + Send + Sync>,
+    },
+}
+
+impl std::fmt::Debug for RenderPrimitiveTexturePairData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(data) => f
+                .debug_tuple("Owned")
+                .field(&format_args!("{} bytes", data.len()))
+                .finish(),
+            Self::Lazy(_) => f.write_str("Lazy(<provider>)"),
+            Self::HalImported { .. } => f.write_str("HalImported(..)"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderPrimitiveTexturePair {
+    pub y_binding: u32,
+    pub uv_binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub data: RenderPrimitiveTexturePairData,
+}
+
+impl RenderPrimitiveTexturePair {
+    pub fn new(
+        y_binding: u32,
+        uv_binding: u32,
+        width: u32,
+        height: u32,
+        stride: u32,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            y_binding,
+            uv_binding,
+            width,
+            height,
+            stride,
+            data: RenderPrimitiveTexturePairData::Owned(data),
+        }
+    }
+
+    pub fn new_lazy(
+        y_binding: u32,
+        uv_binding: u32,
+        width: u32,
+        height: u32,
+        stride: u32,
+        data: RenderPrimitiveNv12BytesProvider,
+    ) -> Self {
+        Self {
+            y_binding,
+            uv_binding,
+            width,
+            height,
+            stride,
+            data: RenderPrimitiveTexturePairData::Lazy(data),
+        }
+    }
+
+    pub fn new_hal_imported(
+        y_binding: u32,
+        uv_binding: u32,
+        width: u32,
+        height: u32,
+        y_texture: Arc<wgpu::Texture>,
+        y_view: Arc<wgpu::TextureView>,
+        uv_texture: Arc<wgpu::Texture>,
+        uv_view: Arc<wgpu::TextureView>,
+        source_keeper: Arc<dyn Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            y_binding,
+            uv_binding,
+            width,
+            height,
+            stride: 0,
+            data: RenderPrimitiveTexturePairData::HalImported {
+                y_texture,
+                y_view,
+                uv_texture,
+                uv_view,
+                source_keeper,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderPrimitiveTexture3d {
+    pub binding: u32,
+    pub size: u32,
+    pub data: Vec<u8>,
+}
+
+impl RenderPrimitiveTexture3d {
+    pub fn new(binding: u32, size: u32, data: Vec<u8>) -> Self {
+        Self {
+            binding,
+            size,
+            data,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RenderPrimitive {
+    pub draw: Option<ShaderSurfaceDraw>,
+    pub texture_key: Option<String>,
+    pub textures_2d: Vec<RenderPrimitiveTexture2d>,
+    pub textures_nv12: Vec<RenderPrimitiveTexturePair>,
+    pub textures_3d: Vec<RenderPrimitiveTexture3d>,
+}
+
+impl RenderPrimitive {
+    pub fn new(texture_key: impl Into<String>) -> Self {
+        Self {
+            draw: None,
+            texture_key: Some(texture_key.into()),
+            textures_2d: Vec::new(),
+            textures_nv12: Vec::new(),
+            textures_3d: Vec::new(),
+        }
+    }
+
+    pub fn draw(mut self, draw: ShaderSurfaceDraw) -> Self {
+        self.draw = Some(draw);
+        self
+    }
+
+    pub fn with_texture_2d(mut self, texture: RenderPrimitiveTexture2d) -> Self {
+        self.textures_2d.push(texture);
+        self
+    }
+
+    pub fn with_texture_nv12(mut self, texture: RenderPrimitiveTexturePair) -> Self {
+        self.textures_nv12.push(texture);
+        self
+    }
+
+    pub fn with_texture_3d(mut self, texture: RenderPrimitiveTexture3d) -> Self {
+        self.textures_3d.push(texture);
+        self
+    }
+}
+
+pub trait PrimitivePipeline: Send + Sync + 'static {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self
+    where
+        Self: Sized;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PrimitiveBounds {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PrimitiveViewport {
+    pub width: f32,
+    pub height: f32,
+}
+
+pub trait Primitive: std::fmt::Debug + Send + Sync + 'static {
+    type Pipeline: PrimitivePipeline;
+
+    fn prepare(
+        &self,
+        pipeline: &mut Self::Pipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bounds: &PrimitiveBounds,
+        viewport: &PrimitiveViewport,
+    );
+    fn render(
+        &self,
+        pipeline: &Self::Pipeline,
+        bounds: &PrimitiveBounds,
+        viewport: &PrimitiveViewport,
+    ) -> RenderPrimitive;
+}
+
+pub fn draw_primitive<P: Primitive>(
+    bounds: PrimitiveBounds,
+    viewport: PrimitiveViewport,
+    primitive: P,
+) {
+    let context = match primitive_render_context().lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(context) = context else {
+        return;
+    };
+
+    let type_id = TypeId::of::<P::Pipeline>();
+    let mut pipelines = match primitive_pipelines().lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    pipelines.entry(type_id).or_insert_with(|| {
+        Box::new(<P::Pipeline as PrimitivePipeline>::new(
+            &context.device,
+            &context.queue,
+            context.format,
+        ))
+    });
+
+    {
+        let Some(pipeline_any) = pipelines.get_mut(&type_id) else {
+            return;
+        };
+        let Some(pipeline) = pipeline_any.downcast_mut::<P::Pipeline>() else {
+            return;
+        };
+        primitive.prepare(
+            pipeline,
+            &context.device,
+            &context.queue,
+            &bounds,
+            &viewport,
+        );
+    }
+
+    let render_primitive = {
+        let Some(pipeline_any) = pipelines.get(&type_id) else {
+            return;
+        };
+        let Some(pipeline) = pipeline_any.downcast_ref::<P::Pipeline>() else {
+            return;
+        };
+        primitive.render(pipeline, &bounds, &viewport)
+    };
+
+    drop(pipelines);
+    submit_render_primitive(render_primitive);
+}
+
+fn upsert_shader_surface_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_texture_pair(texture: ShaderSurfaceTexturePairData) {
+    if let Ok(mut updates) = render_primitive_texture_updates_pair().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_texture_3d(lut: ShaderSurfaceTexture3dData) {
+    if let Ok(mut updates) = render_primitive_texture_3d_updates().lock() {
+        updates.insert(lut.key.clone(), lut);
+    }
+}
+
+fn upsert_shader_surface_caption_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_caption_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_rgba_video_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_rgba_video_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_broll_texture(texture: ShaderSurfaceTextureData) {
+    if let Ok(mut updates) = render_primitive_texture_broll_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_broll_texture_pair(texture: ShaderSurfaceTexturePairData) {
+    if let Ok(mut updates) = render_primitive_texture_broll_nv12_updates().lock() {
+        updates.insert(texture.key.clone(), texture);
+    }
+}
+
+fn upsert_shader_surface_broll_texture_3d(lut: ShaderSurfaceTexture3dData) {
+    if let Ok(mut updates) = render_primitive_texture_broll_lut3d_updates().lock() {
+        updates.insert(lut.key.clone(), lut);
+    }
+}
+
+pub fn submit_render_primitive(primitive: RenderPrimitive) {
+    if let Some(draw) = primitive.draw {
+        queue_render_primitive_draw(draw);
+    }
+
+    let Some(texture_key) = primitive.texture_key else {
+        return;
+    };
+
+    for tex in primitive.textures_2d {
+        let update = ShaderSurfaceTextureData {
+            key: texture_key.clone(),
+            width: tex.width,
+            height: tex.height,
+            bytes: tex.bytes,
+            format: tex.format,
+        };
+        match tex.binding {
+            6 => upsert_shader_surface_caption_texture(update),
+            8 => upsert_shader_surface_rgba_video_texture(update),
+            9 => upsert_shader_surface_broll_texture(update),
+            _ => upsert_shader_surface_texture(update),
+        }
+    }
+
+    for tex in primitive.textures_nv12 {
+        let update = ShaderSurfaceTexturePairData {
+            key: texture_key.clone(),
+            width: tex.width,
+            height: tex.height,
+            stride: tex.stride,
+            data: tex.data,
+        };
+        match (tex.y_binding, tex.uv_binding) {
+            (13, 14) => upsert_shader_surface_broll_texture_pair(update),
+            _ => upsert_shader_surface_texture_pair(update),
+        }
+    }
+
+    for tex in primitive.textures_3d {
+        let update = ShaderSurfaceTexture3dData {
+            key: texture_key.clone(),
+            size: tex.size,
+            data: tex.data,
+        };
+        match tex.binding {
+            11 => upsert_shader_surface_broll_texture_3d(update),
+            _ => upsert_shader_surface_texture_3d(update),
+        }
+    }
+}
+
+/// Clear the cached last-frame draws so that no shader surface is rendered
+/// on the next frame. Without this, the renderer reuses the previous frame's
+/// draws on present-only frames, which causes stale video surfaces to persist
+/// after navigating away from a page that uses shader surfaces.
+pub fn clear_last_render_primitive_draws() {
+    if let Ok(mut last) = last_render_primitive_draws().lock() {
+        last.clear();
+    }
+}
+
+pub fn remove_render_primitive_texture(key: &str) {
+    if let Ok(mut updates) = render_primitive_texture_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_updates_pair().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_3d_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_caption_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_rgba_video_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_broll_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_broll_nv12_updates().lock() {
+        updates.remove(key);
+    }
+    if let Ok(mut updates) = render_primitive_texture_broll_lut3d_updates().lock() {
+        updates.remove(key);
+    }
+}
+
+impl<'a> Default for CustomShaderDescriptor<'a> {
+    fn default() -> Self {
+        Self {
+            label: Some("gpui_custom_shader"),
+            shader_source: DEFAULT_CUSTOM_SHADER_WGSL,
+            vertex_entry: "vs_main",
+            fragment_entry: "fs_main",
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            vertex_count: 3,
+            instance_count: 1,
+            uniform_bytes: None,
+            blend_state: None,
+            texture_mode: CustomShaderTextureMode::None,
+        }
+    }
+}
+
+pub struct WgpuCustomShader {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: Option<wgpu::Buffer>,
+    bind_group_layout: Option<wgpu::BindGroupLayout>,
+    uniform_size: Option<NonZeroU64>,
+    texture_mode: CustomShaderTextureMode,
+    vertex_count: u32,
+    instance_count: u32,
+}
+
+struct NamedCustomShader {
+    shader: WgpuCustomShader,
+    uniform_template: Option<Vec<u8>>,
+    animate_uniforms_with_time: bool,
+}
+
+const VIDEO_TEXTURE_SLOT_COUNT: usize = 3;
+const EXTRA_NV12_TEXTURE_SLOT_COUNT: usize = VIDEO_TEXTURE_SLOT_COUNT - 1;
+
+struct ShaderSurfaceNv12Slot {
+    texture_y: wgpu::Texture,
+    view_y: wgpu::TextureView,
+    texture_uv: wgpu::Texture,
+    view_uv: wgpu::TextureView,
+}
+
+struct ShaderSurfaceTextureGpu {
+    texture_primary: wgpu::Texture,
+    view_primary: wgpu::TextureView,
+    texture_secondary: Option<wgpu::Texture>,
+    view_secondary: Option<wgpu::TextureView>,
+    extra_nv12_slots: Option<[ShaderSurfaceNv12Slot; EXTRA_NV12_TEXTURE_SLOT_COUNT]>,
+    upload_slot: AtomicUsize,
+    render_slot: AtomicUsize,
+    mode: CustomShaderTextureMode,
+    width: u32,
+    height: u32,
+    texture_3d: Option<wgpu::Texture>,
+    view_3d: Option<wgpu::TextureView>,
+    texture_caption: Option<wgpu::Texture>,
+    view_caption: Option<wgpu::TextureView>,
+    texture_rgba: Option<wgpu::Texture>,
+    view_rgba: Option<wgpu::TextureView>,
+    texture_broll: Option<wgpu::Texture>,
+    view_broll: Option<wgpu::TextureView>,
+    texture_broll_y: Option<wgpu::Texture>,
+    view_broll_y: Option<wgpu::TextureView>,
+    texture_broll_uv: Option<wgpu::Texture>,
+    view_broll_uv: Option<wgpu::TextureView>,
+    texture_broll_3d: Option<wgpu::Texture>,
+    view_broll_3d: Option<wgpu::TextureView>,
+    bind_groups: Mutex<HashMap<String, wgpu::BindGroup>>,
+    /// Zero-copy imported NV12 texture views from IOSurface/Metal HAL import.
+    /// When set, these views are used for rendering instead of the slot textures.
+    imported_nv12: Option<ImportedNv12Views>,
+    /// Zero-copy imported NV12 views for the B-roll track.
+    imported_broll_nv12: Option<ImportedNv12Views>,
+}
+
+/// Holds pre-imported GPU textures from the zero-copy IOSurface path.
+/// The Arc wrappers keep the underlying Metal textures (and IOSurface) alive.
+struct ImportedNv12Views {
+    _y_texture: Arc<wgpu::Texture>,
+    y_view: Arc<wgpu::TextureView>,
+    _uv_texture: Arc<wgpu::Texture>,
+    uv_view: Arc<wgpu::TextureView>,
+    _source_keeper: Arc<dyn Any + Send + Sync>,
+}
+
+impl ShaderSurfaceTextureGpu {
+    fn nv12_slot_textures(&self, slot_index: usize) -> Option<(&wgpu::Texture, &wgpu::Texture)> {
+        match slot_index {
+            0 => Some((&self.texture_primary, self.texture_secondary.as_ref()?)),
+            1..VIDEO_TEXTURE_SLOT_COUNT => {
+                let slot = self.extra_nv12_slots.as_ref()?.get(slot_index - 1)?;
+                Some((&slot.texture_y, &slot.texture_uv))
+            }
+            _ => None,
+        }
+    }
+
+    fn nv12_slot_views(
+        &self,
+        slot_index: usize,
+    ) -> Option<(&wgpu::TextureView, &wgpu::TextureView)> {
+        match slot_index {
+            0 => Some((&self.view_primary, self.view_secondary.as_ref()?)),
+            1..VIDEO_TEXTURE_SLOT_COUNT => {
+                let slot = self.extra_nv12_slots.as_ref()?.get(slot_index - 1)?;
+                Some((&slot.view_y, &slot.view_uv))
+            }
+            _ => None,
+        }
+    }
 }
 
 struct WgpuPipelines {
@@ -101,51 +1027,30 @@ struct WgpuBindGroupLayouts {
     surfaces: wgpu::BindGroupLayout,
 }
 
-/// Shared GPU context reference, used to coordinate device recovery across multiple windows.
-pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
-
-/// GPU resources that must be dropped together during device recovery.
-struct WgpuResources {
+pub struct WgpuRenderer {
+    context: Option<GpuContext>,
+    compositor_gpu: Option<CompositorGpuHint>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
+    surface_config: wgpu::SurfaceConfiguration,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
+    atlas: Arc<WgpuAtlas>,
     atlas_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
+    path_globals_offset: u64,
+    gamma_offset: u64,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
+    instance_buffer_capacity: u64,
+    max_buffer_size: u64,
+    storage_buffer_alignment: u64,
     path_intermediate_texture: Option<wgpu::Texture>,
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
-}
-
-impl WgpuResources {
-    fn invalidate_intermediate_textures(&mut self) {
-        self.path_intermediate_texture = None;
-        self.path_intermediate_view = None;
-        self.path_msaa_texture = None;
-        self.path_msaa_view = None;
-    }
-}
-
-pub struct WgpuRenderer {
-    /// Shared GPU context for device recovery coordination (unused on WASM).
-    #[allow(dead_code)]
-    context: Option<GpuContext>,
-    /// Compositor GPU hint for adapter selection (unused on WASM).
-    #[allow(dead_code)]
-    compositor_gpu: Option<CompositorGpuHint>,
-    resources: Option<WgpuResources>,
-    surface_config: wgpu::SurfaceConfiguration,
-    atlas: Arc<WgpuAtlas>,
-    path_globals_offset: u64,
-    gamma_offset: u64,
-    instance_buffer_capacity: u64,
-    max_buffer_size: u64,
-    storage_buffer_alignment: u64,
     rendering_params: RenderingParameters,
     is_bgr: bool,
     dual_source_blending: bool,
@@ -153,31 +1058,124 @@ pub struct WgpuRenderer {
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
-    last_error: Arc<Mutex<Option<String>>>,
-    failed_frame_count: u32,
-    device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    surface_configured: bool,
+    global_custom_shader: Option<WgpuCustomShader>,
+    global_custom_shader_init_failed: bool,
+    global_custom_shader_uniform_template: Option<Vec<u8>>,
+    global_custom_shader_animate_uniforms: bool,
+    global_custom_shader_last_tick: Instant,
+    global_custom_shader_time_seconds: f32,
+    named_custom_shaders: HashMap<String, NamedCustomShader>,
+    shader_surface_textures: HashMap<String, ShaderSurfaceTextureGpu>,
+    custom_shader_fallback_texture_view: wgpu::TextureView,
+    custom_shader_fallback_view_3d: wgpu::TextureView,
     needs_redraw: bool,
 }
 
 impl WgpuRenderer {
-    fn resources(&self) -> &WgpuResources {
-        self.resources
-            .as_ref()
-            .expect("GPU resources not available")
+    fn write_nv12_texture_pair(
+        &self,
+        texture_y: &wgpu::Texture,
+        texture_uv: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        stride: u32,
+        bytes: &[u8],
+    ) -> bool {
+        if width == 0 || height == 0 || stride == 0 {
+            return false;
+        }
+
+        let y_plane_size = (stride * height) as usize;
+        let uv_plane_size = (stride * (height / 2)) as usize;
+        let total_size = y_plane_size + uv_plane_size;
+        if bytes.len() < total_size {
+            return false;
+        }
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: texture_y,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes[..y_plane_size],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: texture_uv,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes[y_plane_size..total_size],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(height / 2),
+            },
+            wgpu::Extent3d {
+                width: width / 2,
+                height: height / 2,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        true
     }
 
-    fn resources_mut(&mut self) -> &mut WgpuResources {
-        self.resources
-            .as_mut()
-            .expect("GPU resources not available")
+    fn write_nv12_texture_pair_update(
+        &self,
+        texture_y: &wgpu::Texture,
+        texture_uv: &wgpu::Texture,
+        update: &ShaderSurfaceTexturePairData,
+    ) -> bool {
+        match &update.data {
+            RenderPrimitiveTexturePairData::Owned(bytes) => self.write_nv12_texture_pair(
+                texture_y,
+                texture_uv,
+                update.width,
+                update.height,
+                update.stride,
+                bytes,
+            ),
+            RenderPrimitiveTexturePairData::Lazy(provider) => {
+                let mut wrote = false;
+                let mut writer = |bytes: &[u8]| {
+                    wrote = self.write_nv12_texture_pair(
+                        texture_y,
+                        texture_uv,
+                        update.width,
+                        update.height,
+                        update.stride,
+                        bytes,
+                    );
+                };
+                provider(&mut writer) && wrote
+            }
+            // HalImported textures are already on the GPU — handled separately
+            // at the call site by swapping texture views, not by write_texture.
+            RenderPrimitiveTexturePairData::HalImported { .. } => true,
+        }
+    }
+
+    fn clear_shader_surface_bind_group_cache(entry: &ShaderSurfaceTextureGpu) {
+        if let Ok(mut bind_groups) = entry.bind_groups.lock() {
+            bind_groups.clear();
+        }
     }
 
     /// Creates a new WgpuRenderer from raw window handles.
-    ///
-    /// The `gpu_context` is a shared reference that coordinates GPU context across
-    /// multiple windows. The first window to create a renderer will initialize the
-    /// context; subsequent windows will share it.
     ///
     /// # Safety
     /// The caller must ensure that the window handle remains valid for the lifetime
@@ -229,16 +1227,10 @@ impl WgpuRenderer {
             None => ctx_ref.insert(WgpuContext::new(instance, &surface, compositor_gpu)?),
         };
 
-        let atlas = Arc::new(WgpuAtlas::from_context(context));
-
-        Self::new_internal(
-            Some(Rc::clone(&gpu_context)),
-            context,
-            surface,
-            config,
-            compositor_gpu,
-            atlas,
-        )
+        let mut renderer = Self::new_with_surface(context, surface, config)?;
+        renderer.context = Some(Rc::clone(&gpu_context));
+        renderer.compositor_gpu = compositor_gpu;
+        Ok(renderer)
     }
 
     #[cfg(target_family = "wasm")]
@@ -251,19 +1243,13 @@ impl WgpuRenderer {
             .instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?;
-
-        let atlas = Arc::new(WgpuAtlas::from_context(context));
-
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_with_surface(context, surface, config)
     }
 
-    fn new_internal(
-        gpu_context: Option<GpuContext>,
+    pub fn new_with_surface(
         context: &WgpuContext,
         surface: wgpu::Surface<'static>,
         config: WgpuSurfaceConfig,
-        compositor_gpu: Option<CompositorGpuHint>,
-        atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
         let preferred_formats = [
@@ -330,21 +1316,21 @@ impl WgpuRenderer {
             );
         }
 
+        let present_mode = config
+            .preferred_present_mode
+            .filter(|mode| surface_caps.present_modes.contains(mode))
+            .unwrap_or(wgpu::PresentMode::Fifo);
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: config
-                .preferred_present_mode
-                .filter(|mode| surface_caps.present_modes.contains(mode))
-                .unwrap_or(wgpu::PresentMode::Fifo),
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
         };
-        // Configure the surface immediately. The adapter selection process already validated
-        // that this adapter can successfully configure this surface.
         surface.configure(&context.device, &surface_config);
 
         let queue = Arc::clone(&context.queue);
@@ -361,12 +1347,94 @@ impl WgpuRenderer {
             dual_source_blending,
         );
 
+        let atlas = Arc::new(WgpuAtlas::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            surface_format,
+        ));
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let custom_shader_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("custom_shader_fallback_texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &custom_shader_fallback_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0, 0, 0, 0],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let custom_shader_fallback_texture_view =
+            custom_shader_fallback_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let custom_shader_fallback_3d = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("custom_shader_fallback_3d"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 2,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let identity_lut_data: [u8; 32] = [
+            0, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255, 0, 0, 255, 255, 255, 0,
+            255, 255, 0, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &custom_shader_fallback_3d,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &identity_lut_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(2),
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 2,
+            },
+        );
+        let custom_shader_fallback_view_3d =
+            custom_shader_fallback_3d.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
 
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
@@ -438,44 +1506,34 @@ impl WgpuRenderer {
         });
 
         let adapter_info = context.adapter.get_info();
+        set_primitive_render_context(Arc::clone(&device), Arc::clone(&queue), surface_format);
 
-        let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let last_error_clone = Arc::clone(&last_error);
-        device.on_uncaptured_error(Arc::new(move |error| {
-            let mut guard = last_error_clone.lock().unwrap();
-            *guard = Some(error.to_string());
-        }));
-
-        let resources = WgpuResources {
+        Ok(Self {
+            context: None,
+            compositor_gpu: None,
             device,
             queue,
             surface,
+            surface_config,
             pipelines,
             bind_group_layouts,
+            atlas,
             atlas_sampler,
             globals_buffer,
+            path_globals_offset,
+            gamma_offset,
             globals_bind_group,
             path_globals_bind_group,
             instance_buffer,
+            instance_buffer_capacity: initial_instance_buffer_capacity,
+            max_buffer_size,
+            storage_buffer_alignment,
             // Defer intermediate texture creation to first draw call via ensure_intermediate_textures().
             // This avoids panics when the device/surface is in an invalid state during initialization.
             path_intermediate_texture: None,
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
-        };
-
-        Ok(Self {
-            context: gpu_context,
-            compositor_gpu,
-            resources: Some(resources),
-            surface_config,
-            atlas,
-            path_globals_offset,
-            gamma_offset,
-            instance_buffer_capacity: initial_instance_buffer_capacity,
-            max_buffer_size,
-            storage_buffer_alignment,
             rendering_params,
             is_bgr: false,
             dual_source_blending,
@@ -483,10 +1541,16 @@ impl WgpuRenderer {
             transparent_alpha_mode,
             opaque_alpha_mode,
             max_texture_size,
-            last_error,
-            failed_frame_count: 0,
-            device_lost: context.device_lost_flag(),
-            surface_configured: true,
+            global_custom_shader: None,
+            global_custom_shader_init_failed: false,
+            global_custom_shader_uniform_template: None,
+            global_custom_shader_animate_uniforms: false,
+            global_custom_shader_last_tick: Instant::now(),
+            global_custom_shader_time_seconds: 0.0,
+            named_custom_shaders: HashMap::new(),
+            shader_surface_textures: HashMap::new(),
+            custom_shader_fallback_texture_view,
+            custom_shader_fallback_view_3d,
             needs_redraw: false,
         })
     }
@@ -623,32 +1687,10 @@ impl WgpuRenderer {
         path_sample_count: u32,
         dual_source_blending: bool,
     ) -> WgpuPipelines {
-        // Diagnostic guard: verify the device actually has
-        // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
-        // feature mismatch caused a wgpu-hal abort, but we haven't
-        // identified the code path that produces the mismatch. This
-        // guard prevents the crash and logs more evidence.
-        // Remove this check once:
-        // a) We find and fix the root cause, or
-        // b) There are no reports of this warning appearing for some time.
-        let device_has_feature = device
-            .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
-        if dual_source_blending && !device_has_feature {
-            log::error!(
-                "BUG: dual_source_blending flag is true but device does not \
-                 have DUAL_SOURCE_BLENDING enabled (device features: {:?}). \
-                 Falling back to mono text rendering. Please report this at \
-                 https://github.com/zed-industries/zed/issues",
-                device.features(),
-            );
-        }
-        let dual_source_blending = dual_source_blending && device_has_feature;
-
         let base_shader_source = include_str!("shaders.wgsl");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpui_shaders"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(base_shader_source)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(base_shader_source)),
         });
 
         let subpixel_shader_source = include_str!("shaders_subpixel.wgsl");
@@ -658,7 +1700,7 @@ impl WgpuRenderer {
             );
             Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(combined)),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(combined)),
             }))
         } else {
             None
@@ -958,14 +2000,8 @@ impl WgpuRenderer {
                 );
             }
 
-            self.surface_config.width = clamped_width.max(1);
-            self.surface_config.height = clamped_height.max(1);
-            let surface_config = self.surface_config.clone();
-
-            let resources = self.resources_mut();
-
             // Wait for any in-flight GPU work to complete before destroying textures
-            if let Err(e) = resources.device.poll(wgpu::PollType::Wait {
+            if let Err(e) = self.device.poll(wgpu::PollType::Wait {
                 submission_index: None,
                 timeout: None,
             }) {
@@ -973,54 +2009,55 @@ impl WgpuRenderer {
             }
 
             // Destroy old textures before allocating new ones to avoid GPU memory spikes
-            if let Some(ref texture) = resources.path_intermediate_texture {
+            if let Some(ref texture) = self.path_intermediate_texture {
                 texture.destroy();
             }
-            if let Some(ref texture) = resources.path_msaa_texture {
+            if let Some(ref texture) = self.path_msaa_texture {
                 texture.destroy();
             }
 
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            self.surface_config.width = clamped_width.max(1);
+            self.surface_config.height = clamped_height.max(1);
+            self.surface.configure(&self.device, &self.surface_config);
 
             // Invalidate intermediate textures - they will be lazily recreated
             // in draw() after we confirm the surface is healthy. This avoids
             // panics when the device/surface is in an invalid state during resize.
-            resources.invalidate_intermediate_textures();
+            self.path_intermediate_texture = None;
+            self.path_intermediate_view = None;
+            self.path_msaa_texture = None;
+            self.path_msaa_view = None;
         }
     }
 
     fn ensure_intermediate_textures(&mut self) {
-        if self.resources().path_intermediate_texture.is_some() {
+        if self.path_intermediate_texture.is_some() {
             return;
         }
 
-        let format = self.surface_config.format;
-        let width = self.surface_config.width;
-        let height = self.surface_config.height;
-        let path_sample_count = self.rendering_params.path_sample_count;
-        let resources = self.resources_mut();
-
-        let (t, v) = Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.path_intermediate_texture = Some(t);
-        resources.path_intermediate_view = Some(v);
+        let (path_intermediate_texture, path_intermediate_view) = {
+            let (t, v) = Self::create_path_intermediate(
+                &self.device,
+                self.surface_config.format,
+                self.surface_config.width,
+                self.surface_config.height,
+            );
+            (Some(t), Some(v))
+        };
+        self.path_intermediate_texture = path_intermediate_texture;
+        self.path_intermediate_view = path_intermediate_view;
 
         let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
-            &resources.device,
-            format,
-            width,
-            height,
-            path_sample_count,
+            &self.device,
+            self.surface_config.format,
+            self.surface_config.width,
+            self.surface_config.height,
+            self.rendering_params.path_sample_count,
         )
         .map(|(t, v)| (Some(t), Some(v)))
         .unwrap_or((None, None));
-        resources.path_msaa_texture = path_msaa_texture;
-        resources.path_msaa_view = path_msaa_view;
-    }
-
-    pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
-        self.is_bgr = is_bgr;
+        self.path_msaa_texture = path_msaa_texture;
+        self.path_msaa_view = path_msaa_view;
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1032,22 +2069,20 @@ impl WgpuRenderer {
 
         if new_alpha_mode != self.surface_config.alpha_mode {
             self.surface_config.alpha_mode = new_alpha_mode;
-            let surface_config = self.surface_config.clone();
-            let path_sample_count = self.rendering_params.path_sample_count;
-            let dual_source_blending = self.dual_source_blending;
-            let resources = self.resources_mut();
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
-            resources.pipelines = Self::create_pipelines(
-                &resources.device,
-                &resources.bind_group_layouts,
-                surface_config.format,
-                surface_config.alpha_mode,
-                path_sample_count,
-                dual_source_blending,
+            self.surface.configure(&self.device, &self.surface_config);
+            self.pipelines = Self::create_pipelines(
+                &self.device,
+                &self.bind_group_layouts,
+                self.surface_config.format,
+                self.surface_config.alpha_mode,
+                self.rendering_params.path_sample_count,
+                self.dual_source_blending,
             );
         }
+    }
+
+    pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
+        self.is_bgr = is_bgr;
     }
 
     #[allow(dead_code)]
@@ -1080,66 +2115,365 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
-        // Bail out early if the surface has been unconfigured (e.g. during
-        // Android background/rotation transitions).  Attempting to acquire
-        // a texture from an unconfigured surface can block indefinitely on
-        // some drivers (Adreno).
-        if !self.surface_configured {
-            return false;
-        }
+        self.ensure_global_custom_shader();
+        let shader_surface_draws = take_render_primitive_draws();
+        self.ensure_named_custom_shaders(&shader_surface_draws);
+        let scene_shader_surface_draws: Vec<_> = scene
+            .shader_surfaces
+            .iter()
+            .map(|surface| surface.draw.clone())
+            .collect();
+        self.ensure_named_custom_shaders(&scene_shader_surface_draws);
+        let runtime = global_custom_shader_runtime()
+            .lock()
+            .map(|runtime| runtime.clone())
+            .unwrap_or_default();
+        let custom_shader_time_seconds = self.advance_custom_shader_time(&runtime);
 
-        let last_error = self.last_error.lock().unwrap().take();
-        if let Some(error) = last_error {
-            self.failed_frame_count += 1;
-            log::error!(
-                "GPU error during frame (failure {} of 10): {error}",
-                self.failed_frame_count
-            );
-
-            // TBD. Does retrying more actually help?
-            if self.failed_frame_count > 10 {
-                panic!("Too many consecutive GPU errors. Last error: {error}");
-            } else if self.failed_frame_count > 5 {
-                if let Some(res) = self.resources.as_mut() {
-                    res.invalidate_intermediate_textures();
+        if let Some(shader) = self.global_custom_shader.take() {
+            if runtime.enabled {
+                if let Err(error) = self.update_global_custom_shader_uniforms(
+                    &shader,
+                    runtime.clone(),
+                    custom_shader_time_seconds,
+                ) {
+                    log::error!("Failed to update global custom shader uniforms: {error:#}");
                 }
-                self.atlas.clear();
-                self.needs_redraw = true;
-                self.failed_frame_count = 0;
-                return false;
+                let did_draw = self.draw_internal(
+                    scene,
+                    Some(&shader),
+                    &shader_surface_draws,
+                    custom_shader_time_seconds,
+                );
+                self.global_custom_shader = Some(shader);
+                did_draw
+            } else {
+                let did_draw = self.draw_internal(
+                    scene,
+                    None,
+                    &shader_surface_draws,
+                    custom_shader_time_seconds,
+                );
+                self.global_custom_shader = Some(shader);
+                did_draw
             }
         } else {
-            self.failed_frame_count = 0;
+            self.draw_internal(
+                scene,
+                None,
+                &shader_surface_draws,
+                custom_shader_time_seconds,
+            )
+        }
+    }
+
+    pub fn draw_with_custom_shader(&mut self, scene: &Scene, shader: &WgpuCustomShader) {
+        let runtime = global_custom_shader_runtime()
+            .lock()
+            .map(|runtime| runtime.clone())
+            .unwrap_or_default();
+        let custom_shader_time_seconds = self.advance_custom_shader_time(&runtime);
+        self.draw_internal(scene, Some(shader), &[], custom_shader_time_seconds);
+    }
+
+    pub fn create_custom_shader(
+        &self,
+        descriptor: CustomShaderDescriptor<'_>,
+    ) -> anyhow::Result<WgpuCustomShader> {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: descriptor.label,
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(descriptor.shader_source)),
+            });
+
+        let uniform_size = descriptor
+            .uniform_bytes
+            .map(|bytes| {
+                NonZeroU64::new(bytes.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("uniform_bytes cannot be empty"))
+            })
+            .transpose()?;
+
+        let uniform_buffer = if let Some(bytes) = descriptor.uniform_bytes {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: descriptor.label,
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, bytes);
+            Some(buffer)
+        } else {
+            None
+        };
+
+        let mut bind_group_layout_entries = Vec::new();
+        if uniform_buffer.is_some() {
+            bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: uniform_size,
+                },
+                count: None,
+            });
+        }
+        match descriptor.texture_mode {
+            CustomShaderTextureMode::VideoPlayerFull => {
+                let tex2d_entry = |binding| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                };
+                let tex3d_entry = |binding| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                };
+                let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                };
+
+                bind_group_layout_entries.push(tex2d_entry(1));
+                bind_group_layout_entries.push(tex2d_entry(2));
+                bind_group_layout_entries.push(sampler_entry(3));
+                bind_group_layout_entries.push(tex3d_entry(4));
+                bind_group_layout_entries.push(sampler_entry(5));
+                bind_group_layout_entries.push(tex2d_entry(6));
+                bind_group_layout_entries.push(sampler_entry(7));
+                bind_group_layout_entries.push(tex2d_entry(8));
+                bind_group_layout_entries.push(tex2d_entry(9));
+                bind_group_layout_entries.push(sampler_entry(10));
+                bind_group_layout_entries.push(tex3d_entry(11));
+                bind_group_layout_entries.push(sampler_entry(12));
+                bind_group_layout_entries.push(tex2d_entry(13));
+                bind_group_layout_entries.push(tex2d_entry(14));
+            }
+            CustomShaderTextureMode::None => {}
         }
 
-        self.atlas.before_frame();
+        let bind_group_layout = if bind_group_layout_entries.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: descriptor.label,
+                        entries: &bind_group_layout_entries,
+                    }),
+            )
+        };
 
-        let frame = match self.resources().surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
+        let default_blend = match self.surface_config.alpha_mode {
+            wgpu::CompositeAlphaMode::PreMultiplied => {
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
             }
+            _ => wgpu::BlendState::ALPHA_BLENDING,
+        };
+
+        let target = wgpu::ColorTargetState {
+            format: self.surface_config.format,
+            blend: Some(descriptor.blend_state.unwrap_or(default_blend)),
+            write_mask: wgpu::ColorWrites::ALL,
+        };
+
+        let layout_refs: [Option<&wgpu::BindGroupLayout>; 1];
+        let bind_group_layouts = if let Some(layout) = bind_group_layout.as_ref() {
+            layout_refs = [Some(layout)];
+            &layout_refs[..]
+        } else {
+            &[]
+        };
+
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: descriptor.label,
+                bind_group_layouts,
+                immediate_size: 0,
+            });
+
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: descriptor.label,
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(descriptor.vertex_entry),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(descriptor.fragment_entry),
+                    targets: &[Some(target)],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: descriptor.primitive_topology,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            });
+
+        Ok(WgpuCustomShader {
+            pipeline,
+            uniform_buffer,
+            bind_group_layout,
+            uniform_size,
+            texture_mode: descriptor.texture_mode,
+            vertex_count: descriptor.vertex_count,
+            instance_count: descriptor.instance_count,
+        })
+    }
+
+    pub fn update_custom_shader_uniforms(
+        &self,
+        shader: &WgpuCustomShader,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let Some(buffer) = shader.uniform_buffer.as_ref() else {
+            anyhow::bail!("shader does not define uniforms");
+        };
+        let Some(size) = shader.uniform_size else {
+            anyhow::bail!("shader does not define uniform size");
+        };
+        anyhow::ensure!(
+            bytes.len() == size.get() as usize,
+            "uniform size mismatch: expected {}, got {}",
+            size.get(),
+            bytes.len()
+        );
+        self.queue.write_buffer(buffer, 0, bytes);
+        Ok(())
+    }
+
+    fn ensure_global_custom_shader(&mut self) {
+        if self.global_custom_shader.is_some() || self.global_custom_shader_init_failed {
+            return;
+        }
+
+        let config = global_custom_shader_config()
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(config) = config else {
+            return;
+        };
+
+        let descriptor = CustomShaderDescriptor {
+            label: config.label.as_deref(),
+            shader_source: &config.shader_source,
+            vertex_entry: &config.vertex_entry,
+            fragment_entry: &config.fragment_entry,
+            primitive_topology: config.primitive_topology,
+            vertex_count: config.vertex_count,
+            instance_count: config.instance_count,
+            uniform_bytes: config.uniform_bytes.as_deref(),
+            blend_state: config.blend_state,
+            texture_mode: config.texture_mode,
+        };
+
+        match self.create_custom_shader(descriptor) {
+            Ok(shader) => {
+                self.global_custom_shader = Some(shader);
+                self.global_custom_shader_uniform_template = config.uniform_bytes.clone();
+                self.global_custom_shader_animate_uniforms = config.animate_uniforms_with_time;
+                self.global_custom_shader_last_tick = Instant::now();
+                self.global_custom_shader_time_seconds = 0.0;
+            }
+            Err(error) => {
+                self.global_custom_shader_init_failed = true;
+                log::error!("Failed to initialize global custom shader: {error:#}");
+            }
+        }
+    }
+
+    fn update_global_custom_shader_uniforms(
+        &mut self,
+        shader: &WgpuCustomShader,
+        runtime: GlobalCustomShaderRuntime,
+        custom_shader_time_seconds: f32,
+    ) -> anyhow::Result<()> {
+        if !self.global_custom_shader_animate_uniforms {
+            return Ok(());
+        }
+
+        let Some(uniform_size) = shader.uniform_size else {
+            return Ok(());
+        };
+
+        let mut bytes = self
+            .global_custom_shader_uniform_template
+            .clone()
+            .unwrap_or_default();
+        bytes.resize(uniform_size.get() as usize, 0);
+
+        self.apply_standard_time_uniforms(&mut bytes, custom_shader_time_seconds);
+
+        if let Some(runtime_bytes) = runtime.uniform_bytes.as_ref() {
+            let len = bytes.len().min(runtime_bytes.len());
+            bytes[..len].copy_from_slice(&runtime_bytes[..len]);
+            self.apply_standard_time_uniforms(&mut bytes, custom_shader_time_seconds);
+        }
+
+        self.update_custom_shader_uniforms(shader, &bytes)
+    }
+
+    fn draw_internal(
+        &mut self,
+        scene: &Scene,
+        custom_shader: Option<&WgpuCustomShader>,
+        shader_surface_draws: &[ShaderSurfaceDraw],
+        custom_shader_time_seconds: f32,
+    ) -> bool {
+        self.atlas.before_frame();
+        self.sync_shader_surface_textures();
+
+        let (frame, surface_suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
+                self.surface.configure(&self.device, &self.surface_config);
                 return false;
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return false;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                *self.last_error.lock().unwrap() =
-                    Some("Surface texture validation error".to_string());
+                log::error!("Failed to acquire surface texture due to validation error");
                 return false;
             }
         };
@@ -1179,35 +2513,96 @@ impl WgpuRenderer {
             ..globals
         };
 
-        {
-            let resources = self.resources();
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                0,
-                bytemuck::bytes_of(&globals),
-            );
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.path_globals_offset,
-                bytemuck::bytes_of(&path_globals),
-            );
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.gamma_offset,
-                bytemuck::bytes_of(&gamma_params),
-            );
-        }
+        self.queue
+            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        self.queue.write_buffer(
+            &self.globals_buffer,
+            self.path_globals_offset,
+            bytemuck::bytes_of(&path_globals),
+        );
+        self.queue.write_buffer(
+            &self.globals_buffer,
+            self.gamma_offset,
+            bytemuck::bytes_of(&gamma_params),
+        );
 
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("main_encoder"),
+                });
 
-            let mut encoder =
-                self.resources()
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("main_encoder"),
-                    });
+            {
+                let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("clear_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+            }
+
+            for draw in shader_surface_draws {
+                let Some(named_shader) = self.named_custom_shaders.get(&draw.shader_key) else {
+                    continue;
+                };
+                if let Err(error) = self.update_named_custom_shader_uniforms(
+                    named_shader,
+                    draw.uniform_bytes.as_deref(),
+                    custom_shader_time_seconds,
+                ) {
+                    log::error!(
+                        "Failed to update shader surface uniforms for '{}': {error:#}",
+                        draw.shader_key
+                    );
+                    continue;
+                }
+
+                let Some((x, y, width, height)) = self.normalized_bounds_to_scissor(draw) else {
+                    continue;
+                };
+
+                if named_shader.shader.vertex_count == 0 || named_shader.shader.instance_count == 0
+                {
+                    continue;
+                }
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shader_surface_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_scissor_rect(x, y, width, height);
+                let texture_entry = draw
+                    .texture_key
+                    .as_ref()
+                    .and_then(|key| self.shader_surface_textures.get(key));
+                self.draw_custom_shader_pass(
+                    &draw.shader_key,
+                    &named_shader.shader,
+                    &mut pass,
+                    texture_entry,
+                );
+            }
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1216,7 +2611,7 @@ impl WgpuRenderer {
                         view: &frame_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -1300,6 +2695,38 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
+                        PrimitiveBatch::ShaderSurfaces(range) => {
+                            let shader_surfaces = &scene.shader_surfaces[range];
+                            if shader_surfaces.is_empty() {
+                                continue;
+                            }
+
+                            drop(pass);
+
+                            self.draw_shader_surfaces(
+                                &mut encoder,
+                                &frame_view,
+                                shader_surfaces,
+                                custom_shader_time_seconds,
+                            );
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            true
+                        }
                         PrimitiveBatch::Surfaces(_surfaces) => {
                             // Surfaces are macOS-only for video playback
                             // Not implemented for Linux/wgpu
@@ -1313,6 +2740,26 @@ impl WgpuRenderer {
                 }
             }
 
+            if let Some(shader) = custom_shader {
+                if shader.vertex_count > 0 && shader.instance_count > 0 {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("custom_shader_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &frame_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    self.draw_custom_shader_pass("", shader, &mut pass, None);
+                }
+            }
+
             if overflow {
                 drop(encoder);
                 if self.instance_buffer_capacity >= self.max_buffer_size {
@@ -1321,17 +2768,1287 @@ impl WgpuRenderer {
                         self.instance_buffer_capacity
                     );
                     frame.present();
+                    if surface_suboptimal {
+                        self.surface.configure(&self.device, &self.surface_config);
+                    }
                     return true;
                 }
                 self.grow_instance_buffer();
                 continue;
             }
 
-            self.resources()
-                .queue
-                .submit(std::iter::once(encoder.finish()));
+            self.queue.submit(std::iter::once(encoder.finish()));
             frame.present();
+            if surface_suboptimal {
+                self.surface.configure(&self.device, &self.surface_config);
+            }
             return true;
+        }
+    }
+
+    fn draw_custom_shader_pass(
+        &self,
+        shader_key: &str,
+        shader: &WgpuCustomShader,
+        pass: &mut wgpu::RenderPass<'_>,
+        texture_entry: Option<&ShaderSurfaceTextureGpu>,
+    ) {
+        pass.set_pipeline(&shader.pipeline);
+        let bind_group = self.create_custom_shader_bind_group(shader_key, shader, texture_entry);
+        if let Some(bind_group) = bind_group {
+            pass.set_bind_group(0, &bind_group, &[]);
+        }
+        pass.draw(0..shader.vertex_count, 0..shader.instance_count);
+    }
+
+    fn create_custom_shader_bind_group(
+        &self,
+        shader_key: &str,
+        shader: &WgpuCustomShader,
+        texture_entry: Option<&ShaderSurfaceTextureGpu>,
+    ) -> Option<wgpu::BindGroup> {
+        let cache_key = if shader.texture_mode == CustomShaderTextureMode::VideoPlayerFull {
+            texture_entry
+                .map(|entry| {
+                    if entry.imported_nv12.is_some() {
+                        // Imported textures change every frame — don't cache
+                        format!("{shader_key}#imported")
+                    } else {
+                        let slot =
+                            entry.render_slot.load(Ordering::Acquire) % VIDEO_TEXTURE_SLOT_COUNT;
+                        format!("{shader_key}#{slot}")
+                    }
+                })
+                .unwrap_or_else(|| shader_key.to_string())
+        } else {
+            shader_key.to_string()
+        };
+
+        if shader.texture_mode == CustomShaderTextureMode::VideoPlayerFull
+            && let Some(entry) = texture_entry
+            && let Ok(bind_groups) = entry.bind_groups.lock()
+            && let Some(bind_group) = bind_groups.get(&cache_key)
+        {
+            return Some(bind_group.clone());
+        }
+
+        let layout = shader.bind_group_layout.as_ref()?;
+        let mut entries = Vec::new();
+
+        if let (Some(buffer), Some(size)) = (shader.uniform_buffer.as_ref(), shader.uniform_size) {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: Some(size),
+                }),
+            });
+        }
+
+        match shader.texture_mode {
+            CustomShaderTextureMode::VideoPlayerFull => {
+                // Prefer zero-copy imported views (IOSurface path), fall back to slot views
+                let imported_views = texture_entry.and_then(|entry| {
+                    entry
+                        .imported_nv12
+                        .as_ref()
+                        .map(|imp| (imp.y_view.as_ref(), imp.uv_view.as_ref()))
+                });
+                let slot_views = texture_entry.and_then(|entry| {
+                    let slot = entry.render_slot.load(Ordering::Acquire) % VIDEO_TEXTURE_SLOT_COUNT;
+                    entry.nv12_slot_views(slot)
+                });
+                let current_nv12_views = imported_views.or(slot_views);
+                let view_y = current_nv12_views
+                    .map(|(view_y, _)| view_y)
+                    .or_else(|| texture_entry.map(|entry| &entry.view_primary))
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let view_uv = current_nv12_views
+                    .map(|(_, view_uv)| view_uv)
+                    .or_else(|| texture_entry.and_then(|entry| entry.view_secondary.as_ref()))
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let lut_view = texture_entry
+                    .and_then(|entry| entry.view_3d.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_view_3d);
+                let caption_view = texture_entry
+                    .and_then(|entry| entry.view_caption.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let rgba_view = texture_entry
+                    .and_then(|entry| entry.view_rgba.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let broll_view = texture_entry
+                    .and_then(|entry| entry.view_broll.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let broll_lut_view = texture_entry
+                    .and_then(|entry| entry.view_broll_3d.as_ref())
+                    .unwrap_or(&self.custom_shader_fallback_view_3d);
+                // Prefer zero-copy imported b-roll views, fall back to CPU-uploaded
+                let imported_broll_views = texture_entry.and_then(|entry| {
+                    entry
+                        .imported_broll_nv12
+                        .as_ref()
+                        .map(|imp| (imp.y_view.as_ref(), imp.uv_view.as_ref()))
+                });
+                let broll_y_view = imported_broll_views
+                    .map(|(y, _)| y)
+                    .or_else(|| texture_entry.and_then(|entry| entry.view_broll_y.as_ref()))
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+                let broll_uv_view = imported_broll_views
+                    .map(|(_, uv)| uv)
+                    .or_else(|| texture_entry.and_then(|entry| entry.view_broll_uv.as_ref()))
+                    .unwrap_or(&self.custom_shader_fallback_texture_view);
+
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view_y),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(view_uv),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(lut_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(caption_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(rgba_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(broll_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(broll_lut_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(broll_y_view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(broll_uv_view),
+                });
+            }
+            CustomShaderTextureMode::None => {}
+        }
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("custom_shader_bind_group"),
+            layout,
+            entries: &entries,
+        });
+
+        if shader.texture_mode == CustomShaderTextureMode::VideoPlayerFull
+            && let Some(entry) = texture_entry
+            && let Ok(mut bind_groups) = entry.bind_groups.lock()
+        {
+            bind_groups.insert(cache_key, bind_group.clone());
+        }
+
+        Some(bind_group)
+    }
+
+    fn ensure_named_custom_shaders(&mut self, draws: &[ShaderSurfaceDraw]) {
+        let configured_shaders = named_custom_shader_configs()
+            .lock()
+            .map(|configs| configs.clone())
+            .unwrap_or_default();
+
+        for draw in draws {
+            if self.named_custom_shaders.contains_key(&draw.shader_key) {
+                continue;
+            }
+            let Some(config) = configured_shaders.get(&draw.shader_key).cloned() else {
+                log::warn!(
+                    "Shader surface referenced unknown shader key '{}'",
+                    draw.shader_key
+                );
+                continue;
+            };
+
+            let descriptor = CustomShaderDescriptor {
+                label: config.label.as_deref(),
+                shader_source: &config.shader_source,
+                vertex_entry: &config.vertex_entry,
+                fragment_entry: &config.fragment_entry,
+                primitive_topology: config.primitive_topology,
+                vertex_count: config.vertex_count,
+                instance_count: config.instance_count,
+                uniform_bytes: config.uniform_bytes.as_deref(),
+                blend_state: config.blend_state,
+                texture_mode: config.texture_mode,
+            };
+
+            match self.create_custom_shader(descriptor) {
+                Ok(shader) => {
+                    self.named_custom_shaders.insert(
+                        draw.shader_key.clone(),
+                        NamedCustomShader {
+                            shader,
+                            uniform_template: config.uniform_bytes,
+                            animate_uniforms_with_time: config.animate_uniforms_with_time,
+                        },
+                    );
+                }
+                Err(error) => {
+                    log::error!(
+                        "Failed to initialize named custom shader '{}': {error:#}",
+                        draw.shader_key
+                    );
+                }
+            }
+        }
+    }
+
+    fn advance_custom_shader_time(&mut self, runtime: &GlobalCustomShaderRuntime) -> f32 {
+        let now = Instant::now();
+        if !runtime.paused {
+            let dt = now
+                .saturating_duration_since(self.global_custom_shader_last_tick)
+                .as_secs_f32();
+            self.global_custom_shader_time_seconds += dt * runtime.time_scale;
+        }
+        self.global_custom_shader_last_tick = now;
+        self.global_custom_shader_time_seconds
+    }
+
+    fn apply_standard_time_uniforms(&self, bytes: &mut [u8], custom_shader_time_seconds: f32) {
+        if bytes.len() < 16 {
+            return;
+        }
+        let params = [
+            custom_shader_time_seconds,
+            self.surface_config.width as f32,
+            self.surface_config.height as f32,
+            0.0f32,
+        ];
+        bytes[..16].copy_from_slice(bytemuck::bytes_of(&params));
+    }
+
+    fn update_named_custom_shader_uniforms(
+        &self,
+        named_shader: &NamedCustomShader,
+        draw_uniform_bytes: Option<&[u8]>,
+        custom_shader_time_seconds: f32,
+    ) -> anyhow::Result<()> {
+        let Some(uniform_size) = named_shader.shader.uniform_size else {
+            return Ok(());
+        };
+
+        let mut bytes = if let Some(draw_uniform_bytes) = draw_uniform_bytes {
+            let mut bytes = draw_uniform_bytes.to_vec();
+            bytes.resize(uniform_size.get() as usize, 0);
+            bytes
+        } else {
+            let mut bytes = named_shader.uniform_template.clone().unwrap_or_default();
+            bytes.resize(uniform_size.get() as usize, 0);
+            bytes
+        };
+
+        if named_shader.animate_uniforms_with_time {
+            self.apply_standard_time_uniforms(&mut bytes, custom_shader_time_seconds);
+        }
+
+        self.update_custom_shader_uniforms(&named_shader.shader, &bytes)
+    }
+
+    fn sync_shader_surface_textures(&mut self) {
+        let updates_rgba = take_render_primitive_texture_updates();
+        let updates_pair = take_render_primitive_texture_updates_pair();
+        let updates_3d = take_render_primitive_texture_3d_updates();
+        let updates_caption = take_render_primitive_texture_caption_updates();
+        let updates_rgba_video = take_render_primitive_texture_rgba_video_updates();
+        let updates_broll = take_render_primitive_texture_broll_updates();
+        let updates_broll_nv12 = take_render_primitive_texture_broll_nv12_updates();
+        let updates_broll_lut3d = take_render_primitive_texture_broll_lut3d_updates();
+
+        for (key, update) in updates_rgba {
+            if update.width == 0 || update.height == 0 {
+                continue;
+            }
+
+            let expected_len = update.width as usize * update.height as usize * 4;
+            if update.bytes.len() < expected_len {
+                continue;
+            }
+
+            let needs_recreate = self
+                .shader_surface_textures
+                .get(&key)
+                .map(|existing| {
+                    existing.width != update.width
+                        || existing.height != update.height
+                        || existing.mode != CustomShaderTextureMode::VideoPlayerFull
+                })
+                .unwrap_or(true);
+
+            if needs_recreate {
+                let texture_primary = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("shader_surface_texture"),
+                    size: wgpu::Extent3d {
+                        width: update.width,
+                        height: update.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: Self::shader_surface_texture_format(update.format),
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view_primary =
+                    texture_primary.create_view(&wgpu::TextureViewDescriptor::default());
+                self.shader_surface_textures.insert(
+                    key.clone(),
+                    ShaderSurfaceTextureGpu {
+                        texture_primary,
+                        view_primary,
+                        texture_secondary: None,
+                        view_secondary: None,
+                        extra_nv12_slots: None,
+                        upload_slot: AtomicUsize::new(0),
+                        render_slot: AtomicUsize::new(0),
+                        mode: CustomShaderTextureMode::VideoPlayerFull,
+                        width: update.width,
+                        height: update.height,
+                        texture_3d: None,
+                        view_3d: None,
+                        texture_caption: None,
+                        view_caption: None,
+                        texture_rgba: None,
+                        view_rgba: None,
+                        texture_broll: None,
+                        view_broll: None,
+                        texture_broll_y: None,
+                        view_broll_y: None,
+                        texture_broll_uv: None,
+                        view_broll_uv: None,
+                        texture_broll_3d: None,
+                        view_broll_3d: None,
+                        bind_groups: Mutex::new(HashMap::new()),
+                        imported_nv12: None,
+                        imported_broll_nv12: None,
+                    },
+                );
+            }
+
+            let Some(entry) = self.shader_surface_textures.get(&key) else {
+                continue;
+            };
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &entry.texture_primary,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &update.bytes[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(update.width * 4),
+                    rows_per_image: Some(update.height),
+                },
+                wgpu::Extent3d {
+                    width: update.width,
+                    height: update.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        for (key, update) in updates_pair {
+            if update.width == 0 || update.height == 0 {
+                continue;
+            }
+
+            // HalImported: store the pre-made texture views directly, skip write_texture
+            if let RenderPrimitiveTexturePairData::HalImported {
+                y_texture,
+                y_view,
+                uv_texture,
+                uv_view,
+                source_keeper,
+            } = &update.data
+            {
+                // Create the ShaderSurfaceTextureGpu entry if it doesn't exist yet.
+                // This happens when the very first frame is HalImported (no prior CPU upload).
+                if !self.shader_surface_textures.contains_key(&key) {
+                    let placeholder = |w, h, fmt| {
+                        self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("shader_surface_placeholder"),
+                            size: wgpu::Extent3d {
+                                width: w,
+                                height: h,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: fmt,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        })
+                    };
+                    let tp = placeholder(update.width, update.height, wgpu::TextureFormat::R8Unorm);
+                    let vp = tp.create_view(&wgpu::TextureViewDescriptor::default());
+                    let ts = placeholder(
+                        update.width / 2,
+                        update.height / 2,
+                        wgpu::TextureFormat::Rg8Unorm,
+                    );
+                    let vs = ts.create_view(&wgpu::TextureViewDescriptor::default());
+                    let extra_nv12_slots = std::array::from_fn(|_| {
+                        let ty =
+                            placeholder(update.width, update.height, wgpu::TextureFormat::R8Unorm);
+                        let vy = ty.create_view(&wgpu::TextureViewDescriptor::default());
+                        let tu = placeholder(
+                            update.width / 2,
+                            update.height / 2,
+                            wgpu::TextureFormat::Rg8Unorm,
+                        );
+                        let vu = tu.create_view(&wgpu::TextureViewDescriptor::default());
+                        ShaderSurfaceNv12Slot {
+                            texture_y: ty,
+                            view_y: vy,
+                            texture_uv: tu,
+                            view_uv: vu,
+                        }
+                    });
+                    self.shader_surface_textures.insert(
+                        key.clone(),
+                        ShaderSurfaceTextureGpu {
+                            texture_primary: tp,
+                            view_primary: vp,
+                            texture_secondary: Some(ts),
+                            view_secondary: Some(vs),
+                            extra_nv12_slots: Some(extra_nv12_slots),
+                            upload_slot: AtomicUsize::new(0),
+                            render_slot: AtomicUsize::new(0),
+                            mode: CustomShaderTextureMode::VideoPlayerFull,
+                            width: update.width,
+                            height: update.height,
+                            texture_3d: None,
+                            view_3d: None,
+                            texture_caption: None,
+                            view_caption: None,
+                            texture_rgba: None,
+                            view_rgba: None,
+                            texture_broll: None,
+                            view_broll: None,
+                            texture_broll_y: None,
+                            view_broll_y: None,
+                            texture_broll_uv: None,
+                            view_broll_uv: None,
+                            texture_broll_3d: None,
+                            view_broll_3d: None,
+                            bind_groups: Mutex::new(HashMap::new()),
+                            imported_nv12: None,
+                            imported_broll_nv12: None,
+                        },
+                    );
+                }
+
+                let entry = self.shader_surface_textures.get_mut(&key).unwrap();
+                if let Some(current) = entry.imported_nv12.as_ref()
+                    && Arc::ptr_eq(&current.y_view, y_view)
+                    && Arc::ptr_eq(&current.uv_view, uv_view)
+                {
+                    continue;
+                }
+
+                if let Some(previous) = entry.imported_nv12.replace(ImportedNv12Views {
+                    _y_texture: Arc::clone(y_texture),
+                    y_view: Arc::clone(y_view),
+                    _uv_texture: Arc::clone(uv_texture),
+                    uv_view: Arc::clone(uv_view),
+                    _source_keeper: Arc::clone(source_keeper),
+                }) {
+                    self.queue.on_submitted_work_done(move || {
+                        drop(previous);
+                    });
+                }
+                Self::clear_shader_surface_bind_group_cache(entry);
+                continue;
+            }
+
+            if update.stride == 0 {
+                continue;
+            }
+
+            let needs_recreate = self
+                .shader_surface_textures
+                .get(&key)
+                .map(|existing| {
+                    existing.width != update.width
+                        || existing.height != update.height
+                        || existing.mode != CustomShaderTextureMode::VideoPlayerFull
+                })
+                .unwrap_or(true);
+
+            if needs_recreate {
+                let texture_primary = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("shader_surface_texture_nv12_y"),
+                    size: wgpu::Extent3d {
+                        width: update.width,
+                        height: update.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view_primary =
+                    texture_primary.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let texture_secondary = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("shader_surface_texture_nv12_uv"),
+                    size: wgpu::Extent3d {
+                        width: update.width / 2,
+                        height: update.height / 2,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rg8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view_secondary =
+                    texture_secondary.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let extra_nv12_slots = std::array::from_fn(|_| {
+                    let texture_y = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("shader_surface_texture_nv12_y_extra"),
+                        size: wgpu::Extent3d {
+                            width: update.width,
+                            height: update.height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::R8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let view_y = texture_y.create_view(&wgpu::TextureViewDescriptor::default());
+                    let texture_uv = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("shader_surface_texture_nv12_uv_extra"),
+                        size: wgpu::Extent3d {
+                            width: update.width / 2,
+                            height: update.height / 2,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rg8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let view_uv = texture_uv.create_view(&wgpu::TextureViewDescriptor::default());
+                    ShaderSurfaceNv12Slot {
+                        texture_y,
+                        view_y,
+                        texture_uv,
+                        view_uv,
+                    }
+                });
+
+                self.shader_surface_textures.insert(
+                    key.clone(),
+                    ShaderSurfaceTextureGpu {
+                        texture_primary,
+                        view_primary,
+                        texture_secondary: Some(texture_secondary),
+                        view_secondary: Some(view_secondary),
+                        extra_nv12_slots: Some(extra_nv12_slots),
+                        upload_slot: AtomicUsize::new(0),
+                        render_slot: AtomicUsize::new(0),
+                        mode: CustomShaderTextureMode::VideoPlayerFull,
+                        width: update.width,
+                        height: update.height,
+                        texture_3d: None,
+                        view_3d: None,
+                        texture_caption: None,
+                        view_caption: None,
+                        texture_rgba: None,
+                        view_rgba: None,
+                        texture_broll: None,
+                        view_broll: None,
+                        texture_broll_y: None,
+                        view_broll_y: None,
+                        texture_broll_uv: None,
+                        view_broll_uv: None,
+                        texture_broll_3d: None,
+                        view_broll_3d: None,
+                        bind_groups: Mutex::new(HashMap::new()),
+                        imported_nv12: None,
+                        imported_broll_nv12: None,
+                    },
+                );
+            }
+
+            let Some(entry) = self.shader_surface_textures.get(&key) else {
+                continue;
+            };
+            let upload_slot =
+                entry.upload_slot.fetch_add(1, Ordering::AcqRel) % VIDEO_TEXTURE_SLOT_COUNT;
+            let Some((texture_y, texture_uv)) = entry.nv12_slot_textures(upload_slot) else {
+                continue;
+            };
+            if !self.write_nv12_texture_pair_update(texture_y, texture_uv, &update) {
+                continue;
+            }
+            entry.render_slot.store(upload_slot, Ordering::Release);
+        }
+
+        for (key, lut) in updates_3d {
+            if lut.size == 0 {
+                continue;
+            }
+            let Some(entry) = self.shader_surface_textures.get_mut(&key) else {
+                continue;
+            };
+
+            let expected_len = (lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(4);
+            if lut.data.len() < expected_len {
+                continue;
+            }
+
+            let lut_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shader_surface_texture3d"),
+                size: wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let lut_view = lut_texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &lut_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &lut.data[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lut.size * 4),
+                    rows_per_image: Some(lut.size),
+                },
+                wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+            );
+
+            entry.texture_3d = Some(lut_texture);
+            entry.view_3d = Some(lut_view);
+            entry.mode = CustomShaderTextureMode::VideoPlayerFull;
+            Self::clear_shader_surface_bind_group_cache(entry);
+        }
+
+        for (key, update) in updates_caption {
+            self.apply_aux_2d_texture_update(
+                &key,
+                update,
+                |entry| entry.texture_caption.as_ref(),
+                |entry, texture, view| {
+                    entry.texture_caption = Some(texture);
+                    entry.view_caption = Some(view);
+                },
+            );
+        }
+
+        for (key, update) in updates_rgba_video {
+            self.apply_aux_2d_texture_update(
+                &key,
+                update,
+                |entry| entry.texture_rgba.as_ref(),
+                |entry, texture, view| {
+                    entry.texture_rgba = Some(texture);
+                    entry.view_rgba = Some(view);
+                },
+            );
+        }
+
+        for (key, update) in updates_broll {
+            self.apply_aux_2d_texture_update(
+                &key,
+                update,
+                |entry| entry.texture_broll.as_ref(),
+                |entry, texture, view| {
+                    entry.texture_broll = Some(texture);
+                    entry.view_broll = Some(view);
+                },
+            );
+        }
+
+        for (key, update) in updates_broll_nv12 {
+            // Ensure a texture entry exists for this key. When the A-roll
+            // player is suppressed (B-roll overlay active from the first
+            // frame), no A-roll NV12 update creates the entry, so the
+            // B-roll texture would be silently dropped.
+            if !self.shader_surface_textures.contains_key(&key) {
+                let placeholder = |w, h, fmt| {
+                    self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("shader_surface_placeholder_for_broll"),
+                        size: wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: fmt,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                };
+                let tp = placeholder(
+                    update.width.max(1),
+                    update.height.max(1),
+                    wgpu::TextureFormat::R8Unorm,
+                );
+                let vp = tp.create_view(&wgpu::TextureViewDescriptor::default());
+                let ts = placeholder(
+                    (update.width / 2).max(1),
+                    (update.height / 2).max(1),
+                    wgpu::TextureFormat::Rg8Unorm,
+                );
+                let vs = ts.create_view(&wgpu::TextureViewDescriptor::default());
+                let extra_nv12_slots = std::array::from_fn(|_| {
+                    let ty = placeholder(
+                        update.width.max(1),
+                        update.height.max(1),
+                        wgpu::TextureFormat::R8Unorm,
+                    );
+                    let vy = ty.create_view(&wgpu::TextureViewDescriptor::default());
+                    let tu = placeholder(
+                        (update.width / 2).max(1),
+                        (update.height / 2).max(1),
+                        wgpu::TextureFormat::Rg8Unorm,
+                    );
+                    let vu = tu.create_view(&wgpu::TextureViewDescriptor::default());
+                    ShaderSurfaceNv12Slot {
+                        texture_y: ty,
+                        view_y: vy,
+                        texture_uv: tu,
+                        view_uv: vu,
+                    }
+                });
+                self.shader_surface_textures.insert(
+                    key.clone(),
+                    ShaderSurfaceTextureGpu {
+                        texture_primary: tp,
+                        view_primary: vp,
+                        texture_secondary: Some(ts),
+                        view_secondary: Some(vs),
+                        extra_nv12_slots: Some(extra_nv12_slots),
+                        upload_slot: AtomicUsize::new(0),
+                        render_slot: AtomicUsize::new(0),
+                        mode: CustomShaderTextureMode::VideoPlayerFull,
+                        width: update.width,
+                        height: update.height,
+                        texture_3d: None,
+                        view_3d: None,
+                        texture_caption: None,
+                        view_caption: None,
+                        texture_rgba: None,
+                        view_rgba: None,
+                        texture_broll: None,
+                        view_broll: None,
+                        texture_broll_y: None,
+                        view_broll_y: None,
+                        texture_broll_uv: None,
+                        view_broll_uv: None,
+                        texture_broll_3d: None,
+                        view_broll_3d: None,
+                        bind_groups: Mutex::new(HashMap::new()),
+                        imported_nv12: None,
+                        imported_broll_nv12: None,
+                    },
+                );
+            }
+
+            // HalImported: store imported views directly, skip write_texture
+            if let RenderPrimitiveTexturePairData::HalImported {
+                y_texture,
+                y_view,
+                uv_texture,
+                uv_view,
+                source_keeper,
+            } = &update.data
+            {
+                if let Some(entry) = self.shader_surface_textures.get_mut(&key) {
+                    entry.imported_broll_nv12 = Some(ImportedNv12Views {
+                        _y_texture: Arc::clone(y_texture),
+                        y_view: Arc::clone(y_view),
+                        _uv_texture: Arc::clone(uv_texture),
+                        uv_view: Arc::clone(uv_view),
+                        _source_keeper: Arc::clone(source_keeper),
+                    });
+                    Self::clear_shader_surface_bind_group_cache(entry);
+                }
+                continue;
+            }
+
+            self.apply_aux_nv12_texture_update(
+                &key,
+                update,
+                |entry| match (
+                    entry.texture_broll_y.as_ref(),
+                    entry.texture_broll_uv.as_ref(),
+                ) {
+                    (Some(y), Some(uv)) => Some((y, uv)),
+                    _ => None,
+                },
+                |entry, y_tex, y_view, uv_tex, uv_view| {
+                    entry.texture_broll_y = Some(y_tex);
+                    entry.view_broll_y = Some(y_view);
+                    entry.texture_broll_uv = Some(uv_tex);
+                    entry.view_broll_uv = Some(uv_view);
+                },
+            );
+        }
+
+        for (key, lut) in updates_broll_lut3d {
+            if lut.size == 0 {
+                continue;
+            }
+            let Some(entry) = self.shader_surface_textures.get_mut(&key) else {
+                continue;
+            };
+
+            let expected_len = (lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(lut.size as usize)
+                .saturating_mul(4);
+            if lut.data.len() < expected_len {
+                continue;
+            }
+
+            let lut_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shader_surface_texture3d_broll"),
+                size: wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let lut_view = lut_texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                ..Default::default()
+            });
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &lut_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &lut.data[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lut.size * 4),
+                    rows_per_image: Some(lut.size),
+                },
+                wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+            );
+
+            entry.texture_broll_3d = Some(lut_texture);
+            entry.view_broll_3d = Some(lut_view);
+            Self::clear_shader_surface_bind_group_cache(entry);
+        }
+    }
+
+    fn apply_aux_2d_texture_update<FGet, FAssign>(
+        &mut self,
+        key: &str,
+        update: ShaderSurfaceTextureData,
+        get_existing: FGet,
+        mut assign: FAssign,
+    ) where
+        FGet: Fn(&ShaderSurfaceTextureGpu) -> Option<&wgpu::Texture>,
+        FAssign: FnMut(&mut ShaderSurfaceTextureGpu, wgpu::Texture, wgpu::TextureView),
+    {
+        if update.width == 0 || update.height == 0 {
+            return;
+        }
+        let expected_len = update.width as usize * update.height as usize * 4;
+        if update.bytes.len() < expected_len {
+            return;
+        }
+
+        let can_reuse = self
+            .shader_surface_textures
+            .get(key)
+            .and_then(|entry| {
+                get_existing(entry).map(|tex| {
+                    let size = tex.size();
+                    size.width == update.width && size.height == update.height
+                })
+            })
+            .unwrap_or(false);
+
+        if can_reuse {
+            let entry = self
+                .shader_surface_textures
+                .get(key)
+                .expect("checked above");
+            let existing = get_existing(entry).expect("checked can_reuse");
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: existing,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &update.bytes[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(update.width * 4),
+                    rows_per_image: Some(update.height),
+                },
+                wgpu::Extent3d {
+                    width: update.width,
+                    height: update.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else {
+            if !self.shader_surface_textures.contains_key(key) {
+                return;
+            }
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shader_surface_texture_aux2d"),
+                size: wgpu::Extent3d {
+                    width: update.width,
+                    height: update.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: Self::shader_surface_texture_format(update.format),
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &update.bytes[..expected_len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(update.width * 4),
+                    rows_per_image: Some(update.height),
+                },
+                wgpu::Extent3d {
+                    width: update.width,
+                    height: update.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let entry = self
+                .shader_surface_textures
+                .get_mut(key)
+                .expect("checked above");
+            assign(entry, texture, view);
+            Self::clear_shader_surface_bind_group_cache(entry);
+        }
+    }
+
+    fn apply_aux_nv12_texture_update<FGet, FAssign>(
+        &mut self,
+        key: &str,
+        update: ShaderSurfaceTexturePairData,
+        get_existing: FGet,
+        mut assign: FAssign,
+    ) where
+        FGet: Fn(&ShaderSurfaceTextureGpu) -> Option<(&wgpu::Texture, &wgpu::Texture)>,
+        FAssign: FnMut(
+            &mut ShaderSurfaceTextureGpu,
+            wgpu::Texture,
+            wgpu::TextureView,
+            wgpu::Texture,
+            wgpu::TextureView,
+        ),
+    {
+        if update.width == 0 || update.height == 0 || update.stride == 0 {
+            return;
+        }
+
+        let can_reuse = self
+            .shader_surface_textures
+            .get(key)
+            .and_then(|entry| {
+                get_existing(entry).map(|(y_tex, uv_tex)| {
+                    let y_size = y_tex.size();
+                    let uv_size = uv_tex.size();
+                    y_size.width == update.width
+                        && y_size.height == update.height
+                        && uv_size.width == update.width / 2
+                        && uv_size.height == update.height / 2
+                })
+            })
+            .unwrap_or(false);
+
+        if can_reuse {
+            let entry = self
+                .shader_surface_textures
+                .get(key)
+                .expect("checked above");
+            let (existing_y, existing_uv) = get_existing(entry).expect("checked can_reuse");
+            if !self.write_nv12_texture_pair_update(existing_y, existing_uv, &update) {
+                return;
+            }
+        } else {
+            if !self.shader_surface_textures.contains_key(key) {
+                return;
+            }
+            let texture_y = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shader_surface_texture_aux_nv12_y"),
+                size: wgpu::Extent3d {
+                    width: update.width,
+                    height: update.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let texture_uv = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shader_surface_texture_aux_nv12_uv"),
+                size: wgpu::Extent3d {
+                    width: update.width / 2,
+                    height: update.height / 2,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            if !self.write_nv12_texture_pair_update(&texture_y, &texture_uv, &update) {
+                return;
+            }
+
+            let view_y = texture_y.create_view(&wgpu::TextureViewDescriptor::default());
+            let view_uv = texture_uv.create_view(&wgpu::TextureViewDescriptor::default());
+            let entry = self
+                .shader_surface_textures
+                .get_mut(key)
+                .expect("checked above");
+            assign(entry, texture_y, view_y, texture_uv, view_uv);
+            Self::clear_shader_surface_bind_group_cache(entry);
+        }
+    }
+
+    fn shader_surface_texture_format(format: ShaderSurfaceTextureFormat) -> wgpu::TextureFormat {
+        match format {
+            ShaderSurfaceTextureFormat::Bgra8Unorm => wgpu::TextureFormat::Bgra8Unorm,
+            ShaderSurfaceTextureFormat::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+        }
+    }
+
+    fn normalized_bounds_to_scissor(
+        &self,
+        draw: &ShaderSurfaceDraw,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let [min_x, min_y, max_x, max_y] = draw.normalized_bounds;
+        let min_x = min_x.clamp(0.0, 1.0);
+        let min_y = min_y.clamp(0.0, 1.0);
+        let max_x = max_x.clamp(0.0, 1.0);
+        let max_y = max_y.clamp(0.0, 1.0);
+
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+
+        let surface_width = self.surface_config.width as f32;
+        let surface_height = self.surface_config.height as f32;
+
+        let x = (min_x * surface_width).floor().max(0.0) as u32;
+        let y = (min_y * surface_height).floor().max(0.0) as u32;
+        let max_x_px = (max_x * surface_width).ceil().max(0.0) as u32;
+        let max_y_px = (max_y * surface_height).ceil().max(0.0) as u32;
+
+        let width = max_x_px.saturating_sub(x);
+        let height = max_y_px.saturating_sub(y);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((x, y, width, height))
+    }
+
+    fn shader_surface_bounds_to_scissor(
+        &self,
+        shader_surface: &PaintShaderSurface,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let clipped_bounds = shader_surface
+            .bounds
+            .intersect(&shader_surface.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return None;
+        }
+
+        let surface_width = self.surface_config.width as f32;
+        let surface_height = self.surface_config.height as f32;
+
+        let min_x = clipped_bounds.origin.x.0.clamp(0.0, surface_width);
+        let min_y = clipped_bounds.origin.y.0.clamp(0.0, surface_height);
+        let max_x =
+            (clipped_bounds.origin.x.0 + clipped_bounds.size.width.0).clamp(0.0, surface_width);
+        let max_y =
+            (clipped_bounds.origin.y.0 + clipped_bounds.size.height.0).clamp(0.0, surface_height);
+
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+
+        let x = min_x.floor() as u32;
+        let y = min_y.floor() as u32;
+        let max_x_px = max_x.ceil() as u32;
+        let max_y_px = max_y.ceil() as u32;
+        let width = max_x_px.saturating_sub(x);
+        let height = max_y_px.saturating_sub(y);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((x, y, width, height))
+    }
+
+    fn draw_shader_surfaces(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_view: &wgpu::TextureView,
+        shader_surfaces: &[PaintShaderSurface],
+        custom_shader_time_seconds: f32,
+    ) {
+        for shader_surface in shader_surfaces {
+            let draw = &shader_surface.draw;
+            let Some(named_shader) = self.named_custom_shaders.get(&draw.shader_key) else {
+                continue;
+            };
+            if let Err(error) = self.update_named_custom_shader_uniforms(
+                named_shader,
+                draw.uniform_bytes.as_deref(),
+                custom_shader_time_seconds,
+            ) {
+                log::error!(
+                    "Failed to update shader surface uniforms for '{}': {error:#}",
+                    draw.shader_key
+                );
+                continue;
+            }
+
+            let Some((x, y, width, height)) = self.shader_surface_bounds_to_scissor(shader_surface)
+            else {
+                continue;
+            };
+
+            if named_shader.shader.vertex_count == 0 || named_shader.shader.instance_count == 0 {
+                continue;
+            }
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene_shader_surface_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_scissor_rect(x, y, width, height);
+            let texture_entry = draw
+                .texture_key
+                .as_ref()
+                .and_then(|key| self.shader_surface_textures.get(key));
+            self.draw_custom_shader_pass(
+                &draw.shader_key,
+                &named_shader.shader,
+                &mut pass,
+                texture_entry,
+            );
         }
     }
 
@@ -1345,7 +4062,7 @@ impl WgpuRenderer {
         self.draw_instances(
             data,
             quads.len() as u32,
-            &self.resources().pipelines.quads,
+            &self.pipelines.quads,
             instance_offset,
             pass,
         )
@@ -1361,7 +4078,7 @@ impl WgpuRenderer {
         self.draw_instances(
             data,
             shadows.len() as u32,
-            &self.resources().pipelines.shadows,
+            &self.pipelines.shadows,
             instance_offset,
             pass,
         )
@@ -1377,7 +4094,7 @@ impl WgpuRenderer {
         self.draw_instances(
             data,
             underlines.len() as u32,
-            &self.resources().pipelines.underlines,
+            &self.pipelines.underlines,
             instance_offset,
             pass,
         )
@@ -1396,7 +4113,7 @@ impl WgpuRenderer {
             data,
             sprites.len() as u32,
             &tex_info.view,
-            &self.resources().pipelines.mono_sprites,
+            &self.pipelines.mono_sprites,
             instance_offset,
             pass,
         )
@@ -1411,12 +4128,11 @@ impl WgpuRenderer {
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
         let data = unsafe { Self::instance_bytes(sprites) };
-        let resources = self.resources();
-        let pipeline = resources
+        let pipeline = self
             .pipelines
             .subpixel_sprites
             .as_ref()
-            .unwrap_or(&resources.pipelines.mono_sprites);
+            .unwrap_or(&self.pipelines.mono_sprites);
         self.draw_instances_with_texture(
             data,
             sprites.len() as u32,
@@ -1440,7 +4156,7 @@ impl WgpuRenderer {
             data,
             sprites.len() as u32,
             &tex_info.view,
-            &self.resources().pipelines.poly_sprites,
+            &self.pipelines.poly_sprites,
             instance_offset,
             pass,
         )
@@ -1460,19 +4176,16 @@ impl WgpuRenderer {
         let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
             return false;
         };
-        let resources = self.resources();
-        let bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &resources.bind_group_layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.instance_binding(offset, size),
-                }],
-            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.bind_group_layouts.instances,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.instance_binding(offset, size),
+            }],
+        });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(0, &self.globals_bind_group, &[]);
         pass.set_bind_group(1, &bind_group, &[]);
         pass.draw(0..4, 0..instance_count);
         true
@@ -1493,29 +4206,26 @@ impl WgpuRenderer {
         let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
             return false;
         };
-        let resources = self.resources();
-        let bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &resources.bind_group_layouts.instances_with_texture,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.instance_binding(offset, size),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
-                    },
-                ],
-            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.bind_group_layouts.instances_with_texture,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.instance_binding(offset, size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                },
+            ],
+        });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(0, &self.globals_bind_group, &[]);
         pass.set_bind_group(1, &bind_group, &[]);
         pass.draw(0..4, 0..instance_count);
         true
@@ -1553,8 +4263,7 @@ impl WgpuRenderer {
             vec![PathSprite { bounds }]
         };
 
-        let resources = self.resources();
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
+        let Some(path_intermediate_view) = self.path_intermediate_view.as_ref() else {
             return true;
         };
 
@@ -1563,7 +4272,7 @@ impl WgpuRenderer {
             sprite_data,
             sprites.len() as u32,
             path_intermediate_view,
-            &resources.pipelines.paths,
+            &self.pipelines.paths,
             instance_offset,
             pass,
         )
@@ -1597,23 +4306,20 @@ impl WgpuRenderer {
             return false;
         };
 
-        let resources = self.resources();
-        let data_bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("path_rasterization_bind_group"),
-                layout: &resources.bind_group_layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.instance_binding(vertex_offset, vertex_size),
-                }],
-            });
+        let data_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("path_rasterization_bind_group"),
+            layout: &self.bind_group_layouts.instances,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.instance_binding(vertex_offset, vertex_size),
+            }],
+        });
 
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
+        let Some(path_intermediate_view) = self.path_intermediate_view.as_ref() else {
             return true;
         };
 
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
+        let (target_view, resolve_target) = if let Some(ref msaa_view) = self.path_msaa_view {
             (msaa_view, Some(path_intermediate_view))
         } else {
             (path_intermediate_view, None)
@@ -1635,8 +4341,8 @@ impl WgpuRenderer {
                 ..Default::default()
             });
 
-            pass.set_pipeline(&resources.pipelines.path_rasterization);
-            pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
+            pass.set_pipeline(&self.pipelines.path_rasterization);
+            pass.set_bind_group(0, &self.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &data_bind_group, &[]);
             pass.draw(0..vertices.len() as u32, 0..1);
         }
@@ -1647,8 +4353,7 @@ impl WgpuRenderer {
     fn grow_instance_buffer(&mut self) {
         let new_capacity = (self.instance_buffer_capacity * 2).min(self.max_buffer_size);
         log::info!("increased instance buffer size to {}", new_capacity);
-        let resources = self.resources_mut();
-        resources.instance_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+        self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buffer"),
             size: new_capacity,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -1667,199 +4372,60 @@ impl WgpuRenderer {
         if offset + size > self.instance_buffer_capacity {
             return None;
         }
-        let resources = self.resources();
-        resources
-            .queue
-            .write_buffer(&resources.instance_buffer, offset, data);
+        self.queue.write_buffer(&self.instance_buffer, offset, data);
         *instance_offset = offset + size;
         Some((offset, NonZeroU64::new(size).expect("size is at least 16")))
     }
 
     fn instance_binding(&self, offset: u64, size: NonZeroU64) -> wgpu::BindingResource<'_> {
         wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: &self.resources().instance_buffer,
+            buffer: &self.instance_buffer,
             offset,
             size: Some(size),
         })
     }
 
-    /// Mark the surface as unconfigured so rendering is skipped until a new
-    /// surface is provided via [`replace_surface`](Self::replace_surface).
-    ///
-    /// This does **not** drop the renderer — the device, queue, atlas, and
-    /// pipelines stay alive.  Use this when the native window is destroyed
-    /// (e.g. Android `TerminateWindow`) but you intend to re-create the
-    /// surface later without losing cached atlas textures.
-    pub fn unconfigure_surface(&mut self) {
-        self.surface_configured = false;
-        // Drop intermediate textures since they reference the old surface size.
-        if let Some(res) = self.resources.as_mut() {
-            res.invalidate_intermediate_textures();
-        }
-    }
-
-    /// Replace the wgpu surface with a new one (e.g. after Android destroys
-    /// and recreates the native window).  Keeps the device, queue, atlas, and
-    /// all pipelines intact so cached `AtlasTextureId`s remain valid.
-    ///
-    /// The `instance` **must** be the same [`wgpu::Instance`] that was used to
-    /// create the adapter and device (i.e. from the [`WgpuContext`]).  Using a
-    /// different instance will cause a "Device does not exist" panic because
-    /// the wgpu device is bound to its originating instance.
-    #[cfg(not(target_family = "wasm"))]
-    pub fn replace_surface<W: HasWindowHandle>(
-        &mut self,
-        window: &W,
-        config: WgpuSurfaceConfig,
-        instance: &wgpu::Instance,
-    ) -> anyhow::Result<()> {
-        let window_handle = window
-            .window_handle()
-            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
-
-        let surface = create_surface(instance, window_handle.as_raw())?;
-
-        let width = (config.size.width.0 as u32).max(1);
-        let height = (config.size.height.0 as u32).max(1);
-
-        let alpha_mode = if config.transparent {
-            self.transparent_alpha_mode
-        } else {
-            self.opaque_alpha_mode
-        };
-
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface_config.alpha_mode = alpha_mode;
-        if let Some(mode) = config.preferred_present_mode {
-            self.surface_config.present_mode = mode;
-        }
-
-        {
-            let res = self
-                .resources
-                .as_mut()
-                .expect("GPU resources not available");
-            surface.configure(&res.device, &self.surface_config);
-            res.surface = surface;
-
-            // Invalidate intermediate textures — they'll be recreated lazily.
-            res.invalidate_intermediate_textures();
-        }
-
-        self.surface_configured = true;
-
-        Ok(())
-    }
-
     pub fn destroy(&mut self) {
-        // Release surface-bound GPU resources eagerly so the underlying native
-        // window can be destroyed before the renderer itself is dropped.
-        self.resources.take();
+        // wgpu resources are automatically cleaned up when dropped
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.
     pub fn device_lost(&self) -> bool {
-        self.device_lost.load(std::sync::atomic::Ordering::SeqCst)
+        self.context
+            .as_ref()
+            .and_then(|context| context.borrow().as_ref().map(WgpuContext::device_lost))
+            .unwrap_or(false)
     }
 
     /// Returns true if a redraw is needed because GPU state was cleared.
-    /// Calling this method clears the flag.
     pub fn needs_redraw(&mut self) -> bool {
         std::mem::take(&mut self.needs_redraw)
     }
 
     /// Recovers from a lost GPU device by recreating the renderer with a new context.
-    ///
-    /// Call this after detecting `device_lost()` returns true.
-    ///
-    /// This method coordinates recovery across multiple windows:
-    /// - The first window to call this will recreate the shared context
-    /// - Subsequent windows will adopt the already-recovered context
     #[cfg(not(target_family = "wasm"))]
     pub fn recover<W>(&mut self, window: &W) -> anyhow::Result<()>
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
-        let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
-
-        // Check if another window already recovered the context
-        let needs_new_context = gpu_context
-            .borrow()
-            .as_ref()
-            .is_none_or(|ctx| ctx.device_lost());
-
-        let window_handle = window
-            .window_handle()
-            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
-
-        let surface = if needs_new_context {
-            log::warn!("GPU device lost, recreating context...");
-
-            // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
-            self.resources = None;
-            *gpu_context.borrow_mut() = None;
-
-            // Wait briefly for the GPU driver to stabilize, then try to
-            // recreate the context without software renderers. If this fails
-            // the caller should request another frame and retry — the real GPU
-            // may need more time to come back (e.g. after suspend/resume).
-            std::thread::sleep(std::time::Duration::from_millis(350));
-
-            let instance = WgpuContext::instance(Box::new(window.clone()));
-            let surface = create_surface(&instance, window_handle.as_raw())?;
-            let new_context =
-                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
-            *gpu_context.borrow_mut() = Some(new_context);
-            surface
-        } else {
-            let ctx_ref = gpu_context.borrow();
-            let instance = &ctx_ref.as_ref().unwrap().instance;
-            create_surface(instance, window_handle.as_raw())?
+        let Some(gpu_context) = self.context.as_ref().cloned() else {
+            return Ok(());
         };
 
+        *gpu_context.borrow_mut() = None;
+
         let config = WgpuSurfaceConfig {
-            size: gpui::Size {
-                width: gpui::DevicePixels(self.surface_config.width as i32),
-                height: gpui::DevicePixels(self.surface_config.height as i32),
+            size: Size {
+                width: DevicePixels(self.surface_config.width as i32),
+                height: DevicePixels(self.surface_config.height as i32),
             },
             transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
             preferred_present_mode: Some(self.surface_config.present_mode),
         };
-        let gpu_context = Rc::clone(gpu_context);
-        let ctx_ref = gpu_context.borrow();
-        let context = ctx_ref.as_ref().expect("context should exist");
 
-        self.resources = None;
-        self.atlas.handle_device_lost(context);
-
-        *self = Self::new_internal(
-            Some(gpu_context.clone()),
-            context,
-            surface,
-            config,
-            self.compositor_gpu,
-            self.atlas.clone(),
-        )?;
-
-        log::info!("GPU recovery complete");
+        *self = Self::new(gpu_context, window, config, self.compositor_gpu)?;
+        self.needs_redraw = true;
         Ok(())
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn create_surface(
-    instance: &wgpu::Instance,
-    raw_window_handle: raw_window_handle::RawWindowHandle,
-) -> anyhow::Result<wgpu::Surface<'static>> {
-    unsafe {
-        instance
-            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                // Fall back to the display handle already provided via InstanceDescriptor::display.
-                raw_display_handle: None,
-                raw_window_handle,
-            })
-            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 

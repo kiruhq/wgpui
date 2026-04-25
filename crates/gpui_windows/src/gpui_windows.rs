@@ -2,7 +2,6 @@
 
 mod clipboard;
 mod destination_list;
-mod direct_manipulation;
 mod direct_write;
 mod directx_atlas;
 mod directx_devices;
@@ -15,6 +14,7 @@ mod platform;
 mod system_settings;
 mod util;
 mod vsync;
+mod wgpu_renderer;
 mod window;
 mod wrapper;
 
@@ -32,6 +32,7 @@ pub(crate) use platform::*;
 pub(crate) use system_settings::*;
 pub(crate) use util::*;
 pub(crate) use vsync::*;
+pub(crate) use wgpu_renderer::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 

@@ -1761,6 +1761,12 @@ impl Window {
         }
     }
 
+    /// Request the window to present its current scene without a full redraw.
+    /// Use this when GPU-side content has changed but layout is unchanged.
+    pub fn request_present(&self) {
+        self.needs_present.set(true);
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
@@ -3882,6 +3888,25 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+        });
+    }
+
+    /// Paint a custom shader surface into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shader_surface(&mut self, bounds: Bounds<Pixels>, draw: crate::ShaderSurfaceDraw) {
+        use crate::PaintShaderSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_primitive(PaintShaderSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            draw,
         });
     }
 
