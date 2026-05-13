@@ -24,6 +24,52 @@ pub struct CompositorGpuHint {
 
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
+    pub fn from_parts_for_surface(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        surface: &wgpu::Surface<'_>,
+    ) -> anyhow::Result<Self> {
+        let caps = surface.get_capabilities(&adapter);
+        if caps.formats.is_empty() {
+            let info = adapter.get_info();
+            anyhow::bail!(
+                "Adapter {:?} (backend={:?}, device={:#06x}) is not compatible with the \
+                 display surface for this window.",
+                info.name,
+                info.backend,
+                info.device,
+            );
+        }
+
+        let color_texture_format = Self::select_color_texture_format(&adapter)?;
+        let dual_source_blending = device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(
         instance: wgpu::Instance,
         surface: &wgpu::Surface<'_>,
