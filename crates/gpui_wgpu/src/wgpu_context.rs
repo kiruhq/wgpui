@@ -15,6 +15,41 @@ pub struct WgpuContext {
 
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
+    pub fn from_parts_for_surface(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        surface: &wgpu::Surface<'_>,
+    ) -> anyhow::Result<Self> {
+        let caps = surface.get_capabilities(&adapter);
+        if caps.formats.is_empty() {
+            let info = adapter.get_info();
+            anyhow::bail!(
+                "Adapter {:?} (backend={:?}, device={:#06x}) is not compatible with the \
+                 display surface for this window.",
+                info.name,
+                info.backend,
+                info.device,
+            );
+        }
+
+        let color_texture_format = Self::pick_color_texture_format(&caps.formats)?;
+        let dual_source_blending = device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            color_texture_format,
+            dual_source_blending,
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(instance: wgpu::Instance, surface: &wgpu::Surface<'_>) -> anyhow::Result<Self> {
         let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)

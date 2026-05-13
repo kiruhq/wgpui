@@ -2059,6 +2059,18 @@ impl WgpuRenderer {
         }
     }
 
+    pub fn device(&self) -> &Arc<wgpu::Device> {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &Arc<wgpu::Queue> {
+        &self.queue
+    }
+
+    pub fn surface_config(&self) -> &wgpu::SurfaceConfiguration {
+        &self.surface_config
+    }
+
     pub fn sprite_atlas(&self) -> &Arc<WgpuAtlas> {
         &self.atlas
     }
