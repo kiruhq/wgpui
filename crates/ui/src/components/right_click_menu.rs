@@ -275,7 +275,7 @@ impl<M: ManagedView> Element for RightClickMenu<M> {
                         *menu.borrow_mut() = Some(new_menu);
                         *position.borrow_mut() = if let Some(child_bounds) = child_bounds {
                             if let Some(attach) = attach {
-                                child_bounds.corner(attach)
+                                child_bounds.anchor(attach)
                             } else {
                                 window.mouse_position()
                             }

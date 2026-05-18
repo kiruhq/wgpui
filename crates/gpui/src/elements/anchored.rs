@@ -37,8 +37,8 @@ pub fn anchored() -> Anchored {
 
 impl Anchored {
     /// Sets which corner of the anchored element should be anchored to the current position.
-    pub fn anchor(mut self, anchor: Anchor) -> Self {
-        self.anchor = anchor;
+    pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
+        self.anchor = anchor.into();
         self
     }
 

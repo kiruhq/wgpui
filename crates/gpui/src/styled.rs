@@ -531,6 +531,12 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the text size to 'medium' (0.9375rem / 15px).
+    fn text_md(mut self) -> Self {
+        self.text_style().font_size = Some(rems(0.9375).into());
+        self
+    }
+
     /// Sets the text size to 'base'.
     /// [Docs](https://tailwindcss.com/docs/font-size#setting-the-font-size)
     fn text_base(mut self) -> Self {
@@ -722,6 +728,25 @@ pub trait Styled: Sized {
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);
+        self
+    }
+
+    /// Sets the grid columns of this element.
+    fn grid_cols(mut self, cols: u16) -> Self {
+        self.style().grid_cols = Some(cols);
+        self
+    }
+
+    /// Sets the grid columns with min-content minimum sizing.
+    /// Unlike grid_cols, it won't shrink to width 0 in AvailableSpace::MinContent constraints.
+    fn grid_cols_min_content(mut self, cols: u16) -> Self {
+        self.style().grid_cols_min_content = Some(cols);
+        self
+    }
+
+    /// Sets the grid rows of this element.
+    fn grid_rows(mut self, rows: u16) -> Self {
+        self.style().grid_rows = Some(rows);
         self
     }
 
