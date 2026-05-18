@@ -9,10 +9,12 @@ use crate::{
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
+    any::Any,
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -36,6 +38,8 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub shader_surfaces: Vec<PaintShaderSurface>,
+    pub external_surfaces: Vec<PaintExternalSurface>,
+    pub render_callbacks: Vec<PaintRenderCallback>,
     pub surfaces: Vec<PaintSurface>,
 }
 
@@ -53,6 +57,8 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.shader_surfaces.clear();
+        self.external_surfaces.clear();
+        self.render_callbacks.clear();
         self.surfaces.clear();
     }
 
@@ -121,6 +127,14 @@ impl Scene {
                 shader_surface.order = order;
                 self.shader_surfaces.push(shader_surface.clone());
             }
+            Primitive::ExternalSurface(external_surface) => {
+                external_surface.order = order;
+                self.external_surfaces.push(external_surface.clone());
+            }
+            Primitive::RenderCallback(render_callback) => {
+                render_callback.order = order;
+                self.render_callbacks.push(render_callback.clone());
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
@@ -153,6 +167,10 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.shader_surfaces
             .sort_by_key(|shader_surface| shader_surface.order);
+        self.external_surfaces
+            .sort_by_key(|external_surface| external_surface.order);
+        self.render_callbacks
+            .sort_by_key(|render_callback| render_callback.order);
         self.surfaces.sort_by_key(|surface| surface.order);
     }
 
@@ -181,6 +199,10 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             shader_surfaces_start: 0,
             shader_surfaces_iter: self.shader_surfaces.iter().peekable(),
+            external_surfaces_start: 0,
+            external_surfaces_iter: self.external_surfaces.iter().peekable(),
+            render_callbacks_start: 0,
+            render_callbacks_iter: self.render_callbacks.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
@@ -205,6 +227,8 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     ShaderSurface,
+    ExternalSurface,
+    RenderCallback,
     Surface,
 }
 
@@ -225,6 +249,8 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     ShaderSurface(PaintShaderSurface),
+    ExternalSurface(PaintExternalSurface),
+    RenderCallback(PaintRenderCallback),
     Surface(PaintSurface),
 }
 
@@ -240,6 +266,8 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::ShaderSurface(shader_surface) => &shader_surface.bounds,
+            Primitive::ExternalSurface(external_surface) => &external_surface.bounds,
+            Primitive::RenderCallback(render_callback) => &render_callback.bounds,
             Primitive::Surface(surface) => &surface.bounds,
         }
     }
@@ -254,6 +282,8 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::ShaderSurface(shader_surface) => &shader_surface.content_mask,
+            Primitive::ExternalSurface(external_surface) => &external_surface.content_mask,
+            Primitive::RenderCallback(render_callback) => &render_callback.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
         }
     }
@@ -283,6 +313,10 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     shader_surfaces_start: usize,
     shader_surfaces_iter: Peekable<slice::Iter<'a, PaintShaderSurface>>,
+    external_surfaces_start: usize,
+    external_surfaces_iter: Peekable<slice::Iter<'a, PaintExternalSurface>>,
+    render_callbacks_start: usize,
+    render_callbacks_iter: Peekable<slice::Iter<'a, PaintRenderCallback>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
 }
@@ -317,6 +351,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.shader_surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::ShaderSurface,
+            ),
+            (
+                self.external_surfaces_iter.peek().map(|s| s.order),
+                PrimitiveKind::ExternalSurface,
+            ),
+            (
+                self.render_callbacks_iter.peek().map(|r| r.order),
+                PrimitiveKind::RenderCallback,
             ),
             (
                 self.surfaces_iter.peek().map(|s| s.order),
@@ -471,6 +513,42 @@ impl<'a> Iterator for BatchIterator<'a> {
                     shader_surfaces_start..shader_surfaces_end,
                 ))
             }
+            PrimitiveKind::ExternalSurface => {
+                let external_surfaces_start = self.external_surfaces_start;
+                let mut external_surfaces_end = external_surfaces_start + 1;
+                self.external_surfaces_iter.next();
+                while self
+                    .external_surfaces_iter
+                    .next_if(|external_surface| {
+                        (external_surface.order, batch_kind) < max_order_and_kind
+                    })
+                    .is_some()
+                {
+                    external_surfaces_end += 1;
+                }
+                self.external_surfaces_start = external_surfaces_end;
+                Some(PrimitiveBatch::ExternalSurfaces(
+                    external_surfaces_start..external_surfaces_end,
+                ))
+            }
+            PrimitiveKind::RenderCallback => {
+                let render_callbacks_start = self.render_callbacks_start;
+                let mut render_callbacks_end = render_callbacks_start + 1;
+                self.render_callbacks_iter.next();
+                while self
+                    .render_callbacks_iter
+                    .next_if(|render_callback| {
+                        (render_callback.order, batch_kind) < max_order_and_kind
+                    })
+                    .is_some()
+                {
+                    render_callbacks_end += 1;
+                }
+                self.render_callbacks_start = render_callbacks_end;
+                Some(PrimitiveBatch::RenderCallbacks(
+                    render_callbacks_start..render_callbacks_end,
+                ))
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -517,6 +595,8 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     ShaderSurfaces(Range<usize>),
+    ExternalSurfaces(Range<usize>),
+    RenderCallbacks(Range<usize>),
     Surfaces(Range<usize>),
 }
 
@@ -787,6 +867,51 @@ pub struct PaintShaderSurface {
 impl From<PaintShaderSurface> for Primitive {
     fn from(shader_surface: PaintShaderSurface) -> Self {
         Primitive::ShaderSurface(shader_surface)
+    }
+}
+
+#[derive(Clone)]
+#[allow(missing_docs)]
+pub struct PaintExternalSurface {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub handle: Arc<dyn Any>,
+}
+
+impl Debug for PaintExternalSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaintExternalSurface")
+            .field("order", &self.order)
+            .field("bounds", &self.bounds)
+            .field("content_mask", &self.content_mask)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<PaintExternalSurface> for Primitive {
+    fn from(external_surface: PaintExternalSurface) -> Self {
+        Primitive::ExternalSurface(external_surface)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(missing_docs)]
+pub struct RenderCallbackId(pub u64);
+
+/// A renderer-owned callback surface that participates in scene ordering and clipping.
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct PaintRenderCallback {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub callback_id: RenderCallbackId,
+}
+
+impl From<PaintRenderCallback> for Primitive {
+    fn from(render_callback: PaintRenderCallback) -> Self {
+        Primitive::RenderCallback(render_callback)
     }
 }
 

@@ -2,8 +2,9 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite,
-    PaintShaderSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
-    ShaderSurfaceDraw, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    PaintExternalSurface, PaintRenderCallback, PaintShaderSurface, Path, Point, PolychromeSprite,
+    PrimitiveBatch, Quad, RenderCallbackId, ScaledPixels, Scene, ShaderSurfaceDraw, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -14,12 +15,144 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 pub type RenderPrimitiveNv12BytesProvider =
     Arc<dyn Fn(&mut dyn FnMut(&[u8])) -> bool + Send + Sync>;
+
+type WgpuRenderCallbackFn =
+    dyn Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView, &WgpuRenderCallbackContext) + Send + Sync;
+
+static NEXT_RENDER_CALLBACK_ID: AtomicU64 = AtomicU64::new(1);
+static WGPU_RENDER_CALLBACKS: OnceLock<
+    Mutex<HashMap<RenderCallbackId, Arc<WgpuRenderCallbackFn>>>,
+> = OnceLock::new();
+
+fn wgpu_render_callbacks() -> &'static Mutex<HashMap<RenderCallbackId, Arc<WgpuRenderCallbackFn>>> {
+    WGPU_RENDER_CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Context passed to renderer-owned callback surfaces during the WGPU draw pass.
+pub struct WgpuRenderCallbackContext<'a> {
+    pub device: &'a Arc<wgpu::Device>,
+    pub queue: &'a Arc<wgpu::Queue>,
+    pub surface_config: &'a wgpu::SurfaceConfiguration,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: Bounds<ScaledPixels>,
+    pub scissor_rect: (u32, u32, u32, u32),
+}
+
+/// A registered callback that can render into a GPUI WGPU frame.
+#[derive(Clone)]
+pub struct WgpuRenderCallback {
+    inner: Arc<WgpuRenderCallbackInner>,
+}
+
+impl WgpuRenderCallback {
+    pub fn new(
+        callback: impl Fn(&mut wgpu::CommandEncoder, &wgpu::TextureView, &WgpuRenderCallbackContext)
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        let id = RenderCallbackId(NEXT_RENDER_CALLBACK_ID.fetch_add(1, Ordering::Relaxed));
+        if let Ok(mut callbacks) = wgpu_render_callbacks().lock() {
+            callbacks.insert(id, Arc::new(callback));
+        }
+        Self {
+            inner: Arc::new(WgpuRenderCallbackInner { id }),
+        }
+    }
+
+    pub fn id(&self) -> RenderCallbackId {
+        self.inner.id
+    }
+}
+
+struct WgpuRenderCallbackInner {
+    id: RenderCallbackId,
+}
+
+impl Drop for WgpuRenderCallbackInner {
+    fn drop(&mut self) {
+        if let Ok(mut callbacks) = wgpu_render_callbacks().lock() {
+            callbacks.remove(&self.id);
+        }
+    }
+}
+
+/// Context passed to renderer-owned external surfaces during the WGPU draw pass.
+pub struct WgpuExternalSurfaceContext<'a> {
+    pub device: &'a Arc<wgpu::Device>,
+    pub queue: &'a Arc<wgpu::Queue>,
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    pub target: &'a wgpu::TextureView,
+    pub surface_format: wgpu::TextureFormat,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: Bounds<ScaledPixels>,
+    pub scissor: (u32, u32, u32, u32),
+    pub corner_radius: ScaledPixels,
+    pub viewport: Size<DevicePixels>,
+}
+
+/// Renderer-owned surface that can draw into a GPUI WGPU frame.
+pub trait WgpuExternalSurface: 'static {
+    fn render(&self, context: WgpuExternalSurfaceContext<'_>);
+}
+
+struct WgpuExternalSurfaceHandle {
+    surface: Arc<dyn WgpuExternalSurface>,
+    corner_radius: ScaledPixels,
+}
+
+impl WgpuExternalSurfaceHandle {
+    fn new(surface: Arc<dyn WgpuExternalSurface>) -> Self {
+        Self {
+            surface,
+            corner_radius: ScaledPixels(0.),
+        }
+    }
+
+    fn with_corner_radius(
+        surface: Arc<dyn WgpuExternalSurface>,
+        corner_radius: ScaledPixels,
+    ) -> Self {
+        Self {
+            surface,
+            corner_radius,
+        }
+    }
+}
+
+pub fn wgpu_surface(surface: Arc<dyn WgpuExternalSurface>) -> gpui::ExternalSurface {
+    gpui::external_surface(Arc::new(WgpuExternalSurfaceHandle::new(surface)))
+}
+
+pub fn paint_wgpu_surface(
+    window: &mut gpui::Window,
+    bounds: gpui::Bounds<gpui::Pixels>,
+    surface: Arc<dyn WgpuExternalSurface>,
+) {
+    window.paint_external_surface(bounds, Arc::new(WgpuExternalSurfaceHandle::new(surface)));
+}
+
+pub fn paint_wgpu_surface_with_corner_radius(
+    window: &mut gpui::Window,
+    bounds: gpui::Bounds<gpui::Pixels>,
+    surface: Arc<dyn WgpuExternalSurface>,
+    corner_radius: gpui::Pixels,
+) {
+    let corner_radius = ScaledPixels(f32::from(corner_radius) * window.scale_factor());
+    window.paint_external_surface(
+        bounds,
+        Arc::new(WgpuExternalSurfaceHandle::with_corner_radius(
+            surface,
+            corner_radius,
+        )),
+    );
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -2739,6 +2872,64 @@ impl WgpuRenderer {
 
                             true
                         }
+                        PrimitiveBatch::ExternalSurfaces(range) => {
+                            let external_surfaces = &scene.external_surfaces[range];
+                            if external_surfaces.is_empty() {
+                                continue;
+                            }
+
+                            drop(pass);
+
+                            self.draw_external_surfaces(
+                                &mut encoder,
+                                &frame_view,
+                                external_surfaces,
+                            );
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            true
+                        }
+                        PrimitiveBatch::RenderCallbacks(range) => {
+                            let render_callbacks = &scene.render_callbacks[range];
+                            if render_callbacks.is_empty() {
+                                continue;
+                            }
+
+                            drop(pass);
+
+                            self.draw_render_callbacks(&mut encoder, &frame_view, render_callbacks);
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            true
+                        }
                         PrimitiveBatch::Surfaces(_surfaces) => {
                             // Surfaces are macOS-only for video playback
                             // Not implemented for Linux/wgpu
@@ -4001,6 +4192,147 @@ impl WgpuRenderer {
         }
 
         Some((x, y, width, height))
+    }
+
+    fn render_callback_bounds_to_scissor(
+        &self,
+        render_callback: &PaintRenderCallback,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let clipped_bounds = render_callback
+            .bounds
+            .intersect(&render_callback.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return None;
+        }
+
+        let surface_width = self.surface_config.width as f32;
+        let surface_height = self.surface_config.height as f32;
+
+        let min_x = clipped_bounds.origin.x.0.clamp(0.0, surface_width);
+        let min_y = clipped_bounds.origin.y.0.clamp(0.0, surface_height);
+        let max_x =
+            (clipped_bounds.origin.x.0 + clipped_bounds.size.width.0).clamp(0.0, surface_width);
+        let max_y =
+            (clipped_bounds.origin.y.0 + clipped_bounds.size.height.0).clamp(0.0, surface_height);
+
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+
+        let x = min_x.floor() as u32;
+        let y = min_y.floor() as u32;
+        let max_x_px = max_x.ceil() as u32;
+        let max_y_px = max_y.ceil() as u32;
+        let width = max_x_px.saturating_sub(x);
+        let height = max_y_px.saturating_sub(y);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((x, y, width, height))
+    }
+
+    fn external_surface_bounds_to_scissor(
+        &self,
+        external_surface: &PaintExternalSurface,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let clipped_bounds = external_surface
+            .bounds
+            .intersect(&external_surface.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return None;
+        }
+
+        let surface_width = self.surface_config.width as f32;
+        let surface_height = self.surface_config.height as f32;
+
+        let min_x = clipped_bounds.origin.x.0.clamp(0.0, surface_width);
+        let min_y = clipped_bounds.origin.y.0.clamp(0.0, surface_height);
+        let max_x =
+            (clipped_bounds.origin.x.0 + clipped_bounds.size.width.0).clamp(0.0, surface_width);
+        let max_y =
+            (clipped_bounds.origin.y.0 + clipped_bounds.size.height.0).clamp(0.0, surface_height);
+
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+
+        let x = min_x.floor() as u32;
+        let y = min_y.floor() as u32;
+        let max_x_px = max_x.ceil() as u32;
+        let max_y_px = max_y.ceil() as u32;
+        let width = max_x_px.saturating_sub(x);
+        let height = max_y_px.saturating_sub(y);
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((x, y, width, height))
+    }
+
+    fn draw_external_surfaces(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_view: &wgpu::TextureView,
+        external_surfaces: &[PaintExternalSurface],
+    ) {
+        for external_surface in external_surfaces {
+            let Some(handle) = external_surface
+                .handle
+                .downcast_ref::<WgpuExternalSurfaceHandle>()
+            else {
+                continue;
+            };
+            let Some(scissor) = self.external_surface_bounds_to_scissor(external_surface) else {
+                continue;
+            };
+
+            handle.surface.render(WgpuExternalSurfaceContext {
+                device: &self.device,
+                queue: &self.queue,
+                encoder,
+                target: frame_view,
+                surface_format: self.surface_config.format,
+                bounds: external_surface.bounds,
+                content_mask: external_surface.content_mask.bounds,
+                scissor,
+                corner_radius: handle.corner_radius,
+                viewport: Size {
+                    width: DevicePixels(self.surface_config.width as i32),
+                    height: DevicePixels(self.surface_config.height as i32),
+                },
+            });
+        }
+    }
+
+    fn draw_render_callbacks(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_view: &wgpu::TextureView,
+        render_callbacks: &[PaintRenderCallback],
+    ) {
+        for render_callback in render_callbacks {
+            let Some(scissor_rect) = self.render_callback_bounds_to_scissor(render_callback) else {
+                continue;
+            };
+            let callback = wgpu_render_callbacks()
+                .lock()
+                .ok()
+                .and_then(|callbacks| callbacks.get(&render_callback.callback_id).cloned());
+            let Some(callback) = callback else {
+                continue;
+            };
+
+            let context = WgpuRenderCallbackContext {
+                device: &self.device,
+                queue: &self.queue,
+                surface_config: &self.surface_config,
+                bounds: render_callback.bounds,
+                content_mask: render_callback.content_mask.bounds,
+                scissor_rect,
+            };
+            callback(encoder, frame_view, &context);
+        }
     }
 
     fn draw_shader_surfaces(
