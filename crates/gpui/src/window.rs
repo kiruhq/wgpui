@@ -3652,6 +3652,50 @@ impl Window {
         });
     }
 
+    /// Paint a renderer-owned external surface into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_external_surface(&mut self, bounds: Bounds<Pixels>, handle: Arc<dyn Any>) {
+        use crate::PaintExternalSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame
+            .scene
+            .insert_primitive(PaintExternalSurface {
+                order: 0,
+                bounds,
+                content_mask,
+                handle,
+            });
+    }
+
+    /// Paint a renderer-owned callback surface into the scene for the next frame.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_render_callback_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        callback_id: crate::RenderCallbackId,
+    ) {
+        use crate::PaintRenderCallback;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_primitive(PaintRenderCallback {
+            order: 0,
+            bounds,
+            content_mask,
+            callback_id,
+        });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

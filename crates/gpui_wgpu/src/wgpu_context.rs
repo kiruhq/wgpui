@@ -183,12 +183,11 @@ impl WgpuContext {
         #[cfg(target_os = "linux")]
         let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
 
-        wgpu::Instance::new(wgpu::InstanceDescriptor {
+        wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: None,
         })
     }
 
