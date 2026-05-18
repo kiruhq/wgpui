@@ -18,7 +18,6 @@ use gpui::{
     SharedString, SourceMetadata, size,
 };
 use media::core_media::{CMSampleBuffer, CMSampleBufferRef};
-use metal::NSInteger;
 use objc::{
     class,
     declare::ClassDecl,
@@ -47,7 +46,7 @@ static mut OUTPUT_CLASS: *const Class = ptr::null();
 const FRAME_CALLBACK_IVAR: &str = "frame_callback";
 
 #[allow(non_upper_case_globals)]
-const SCStreamOutputTypeScreen: NSInteger = 0;
+const SCStreamOutputTypeScreen: isize = 0;
 
 impl ScreenCaptureSource for MacScreenCaptureSource {
     fn metadata(&self) -> Result<SourceMetadata> {
