@@ -1169,7 +1169,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
 
                                 let scroll_track_bounds = Bounds::from_anchor_and_size(
                                     track_anchor,
-                                    self.origin + bounds.corner(track_anchor),
+                                    self.origin + bounds.anchor(track_anchor),
                                     bounds.size.apply_along(axis.invert(), |_| {
                                         width
                                             + match state.style {

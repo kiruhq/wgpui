@@ -531,6 +531,12 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the text size to 'medium' (0.9375rem / 15px).
+    fn text_md(mut self) -> Self {
+        self.text_style().font_size = Some(rems(0.9375).into());
+        self
+    }
+
     /// Sets the text size to 'base'.
     /// [Docs](https://tailwindcss.com/docs/font-size#setting-the-font-size)
     fn text_base(mut self) -> Self {
