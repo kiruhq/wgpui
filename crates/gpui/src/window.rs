@@ -4086,7 +4086,12 @@ impl Window {
             PlatformInput::KeyDown(_) | PlatformInput::ModifiersChanged(_) => {
                 InputModality::Keyboard
             }
-            PlatformInput::MouseDown(e) if e.is_focusing() => InputModality::Mouse,
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_)
+            | PlatformInput::MousePressure(_)
+            | PlatformInput::ScrollWheel(_)
+            | PlatformInput::Pinch(_) => InputModality::Mouse,
             _ => self.last_input_modality,
         };
 
