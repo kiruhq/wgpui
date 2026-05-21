@@ -154,6 +154,12 @@ impl WgpuContext {
                 Subpixel text antialiasing will be disabled."
             );
         }
+        if adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+        {
+            required_features |= wgpu::Features::TEXTURE_FORMAT_NV12;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
