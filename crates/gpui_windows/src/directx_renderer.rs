@@ -337,6 +337,9 @@ impl DirectXRenderer {
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
+                PrimitiveBatch::ShaderSurfaces(_)
+                | PrimitiveBatch::ExternalSurfaces(_)
+                | PrimitiveBatch::RenderCallbacks(_) => Ok(()),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
             .context(format!(
