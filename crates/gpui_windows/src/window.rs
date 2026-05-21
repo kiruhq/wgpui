@@ -26,6 +26,7 @@ use windows::{
     core::*,
 };
 
+use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
 use gpui::*;
 
@@ -57,12 +58,16 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<wgpu_renderer::Renderer>,
     pub wgpu_context: wgpu_renderer::Context,
+    pub force_render_after_recovery: Cell<bool>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
+    /// Shared with [`WindowsPlatformState::cursor_visible`].
+    pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
 
     pub display: Cell<WindowsDisplay>,
@@ -95,6 +100,7 @@ impl WindowsWindowState {
         _directx_devices: &DirectXDevices,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
+        cursor_visible: Arc<AtomicBool>,
         display: WindowsDisplay,
         min_size: Option<Size<Pixels>>,
         appearance: WindowAppearance,
@@ -136,6 +142,8 @@ impl WindowsWindowState {
         let nc_button_pressed = None;
         let fullscreen = None;
         let initial_placement = None;
+        let direct_manipulation = DirectManipulationHandler::new(hwnd, scale_factor)
+            .context("initializing Direct Manipulation")?;
 
         Ok(Self {
             origin: Cell::new(origin),
@@ -154,10 +162,13 @@ impl WindowsWindowState {
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            direct_manipulation,
             renderer: RefCell::new(renderer),
             wgpu_context,
+            force_render_after_recovery: Cell::new(false),
             click_state,
             current_cursor: Cell::new(current_cursor),
+            cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
@@ -233,6 +244,7 @@ impl WindowsWindowInner {
             &context.directx_devices,
             cs,
             context.current_cursor,
+            context.cursor_visible.clone(),
             context.display,
             context.min_size,
             context.appearance,
@@ -372,6 +384,7 @@ struct WindowCreateContext {
     min_size: Option<Size<Pixels>>,
     executor: ForegroundExecutor,
     current_cursor: Option<HCURSOR>,
+    cursor_visible: Arc<AtomicBool>,
     drop_target_helper: IDropTargetHelper,
     validation_number: usize,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
@@ -393,6 +406,7 @@ impl WindowsWindow {
             icon,
             executor,
             current_cursor,
+            cursor_visible,
             drop_target_helper,
             validation_number,
             main_receiver,
@@ -474,6 +488,7 @@ impl WindowsWindow {
             min_size: params.window_min_size,
             executor,
             current_cursor,
+            cursor_visible,
             drop_target_helper,
             validation_number,
             main_receiver,
