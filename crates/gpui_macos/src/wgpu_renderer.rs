@@ -1,13 +1,12 @@
 use anyhow::Result;
 use gpui::{DevicePixels, Scene, Size};
-use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
-use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
-pub(crate) type Context = Arc<Mutex<Option<WgpuContext>>>;
+pub(crate) type Context = GpuContext;
 pub(crate) type Renderer = WgpuMacRenderer;
 
 pub(crate) unsafe fn new_renderer(
@@ -32,16 +31,14 @@ pub(crate) unsafe fn new_renderer(
             height: DevicePixels(bounds.height.max(1.0).round() as i32),
         },
         transparent,
+        preferred_present_mode: None,
     };
 
-    let renderer = {
-        let mut context = context.lock();
-        match WgpuRenderer::new(&mut context, &raw_window, config) {
-            Ok(renderer) => renderer,
-            Err(error) => {
-                log::error!("Failed to initialize wgpu renderer: {error:#}");
-                std::process::exit(1);
-            }
+    let renderer = match WgpuRenderer::new(context, &raw_window, config, None) {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            log::error!("Failed to initialize wgpu renderer: {error:#}");
+            std::process::exit(1);
         }
     };
 
