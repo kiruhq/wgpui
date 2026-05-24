@@ -75,6 +75,7 @@ mod seal {
     pub trait Sealed {}
 }
 
+pub use accesskit::{Orientation, Role, Toggled};
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
@@ -120,6 +121,7 @@ pub use test::*;
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
+pub use window::a11y::A11yActionRequest;
 pub use window::*;
 
 pub use pollster::block_on;
