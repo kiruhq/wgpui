@@ -207,6 +207,12 @@ impl WgpuContext {
         {
             required_features |= wgpu::Features::TEXTURE_FORMAT_NV12;
         }
+        if adapter.features().contains(
+            wgpu::Features::TEXTURE_FORMAT_P010 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+        ) {
+            required_features |=
+                wgpu::Features::TEXTURE_FORMAT_P010 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+        }
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
 
