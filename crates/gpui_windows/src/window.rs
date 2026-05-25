@@ -23,7 +23,9 @@ use windows::{
         Foundation::*,
         Graphics::Dwm::*,
         Graphics::Gdi::*,
-        System::{Com::*, LibraryLoader::*, Ole::*, SystemServices::*},
+        System::{
+            Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
+        },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
     core::*,
