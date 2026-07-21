@@ -2855,6 +2855,8 @@ async fn synthetic_drag(
     event: MouseMoveEvent,
     executor: BackgroundExecutor,
 ) {
+    let mut event = event;
+    event.delta = None;
     loop {
         executor.timer(Duration::from_millis(16)).await;
         if let Some(window_state) = window_state.upgrade() {

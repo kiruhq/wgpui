@@ -412,6 +412,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
     pub fn simulate_mouse_move(&mut self, position: Point<Pixels>) {
         self.simulate_event(MouseMoveEvent {
             position,
+            delta: None,
             modifiers: Default::default(),
             pressed_button: None,
         });

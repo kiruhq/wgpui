@@ -1879,6 +1879,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     let input = PlatformInput::MouseMove(MouseMoveEvent {
                         position: state.mouse_location.unwrap(),
+                        delta: None,
                         pressed_button: state.button_pressed,
                         modifiers: state.modifiers,
                     });

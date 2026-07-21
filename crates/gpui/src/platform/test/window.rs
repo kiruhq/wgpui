@@ -162,6 +162,10 @@ impl PlatformWindow for TestWindow {
         Point::default()
     }
 
+    fn set_mouse_position(&self, _position: Point<Pixels>) -> bool {
+        true
+    }
+
     fn modifiers(&self) -> crate::Modifiers {
         crate::Modifiers::default()
     }

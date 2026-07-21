@@ -321,6 +321,7 @@ impl WindowsWindowInner {
         let y = lparam.signed_hiword() as f32;
         let input = PlatformInput::MouseMove(MouseMoveEvent {
             position: logical_point(x, y, scale_factor),
+            delta: None,
             pressed_button,
             modifiers: current_modifiers(),
         });
@@ -964,6 +965,7 @@ impl WindowsWindowInner {
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         let input = PlatformInput::MouseMove(MouseMoveEvent {
             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
+            delta: None,
             pressed_button: None,
             modifiers: current_modifiers(),
         });

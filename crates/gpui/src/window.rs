@@ -4496,6 +4496,7 @@ impl Window {
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
+                        delta: None,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
                     })
@@ -4504,6 +4505,7 @@ impl Window {
                     self.mouse_position = position;
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
+                        delta: None,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
                     })
@@ -5673,6 +5675,7 @@ impl Window {
     pub fn simulate_mouse_move(&mut self, position: Point<Pixels>, cx: &mut App) {
         let event = PlatformInput::MouseMove(MouseMoveEvent {
             position,
+            delta: None,
             modifiers: self.modifiers,
             pressed_button: None,
         });

@@ -401,6 +401,11 @@ pub struct MouseMoveEvent {
     /// The position of the mouse on the window.
     pub position: Point<Pixels>,
 
+    /// Relative mouse movement reported by the platform for this event.
+    ///
+    /// This remains available when the absolute cursor position is constrained by a display edge.
+    pub delta: Option<Point<Pixels>>,
+
     /// The mouse button that was pressed, if any.
     pub pressed_button: Option<MouseButton>,
 

@@ -1272,6 +1272,7 @@ impl X11Client {
                 if event.valuator_mask[0] & 3 != 0 {
                     window.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
                         position,
+                        delta: None,
                         pressed_button,
                         modifiers,
                     }));

@@ -206,6 +206,7 @@ impl WebWindowInner {
 
             this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
                 position,
+                delta: None,
                 pressed_button: current_pressed,
                 modifiers,
             }));

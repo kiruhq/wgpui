@@ -265,6 +265,7 @@ impl VisualTestAppContext {
             window,
             MouseMoveEvent {
                 position,
+                delta: None,
                 modifiers,
                 pressed_button: button.into(),
             },
