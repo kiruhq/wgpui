@@ -1231,6 +1231,28 @@ impl PlatformWindow for MacWindow {
         convert_mouse_position(position, self.content_size().height)
     }
 
+    fn set_mouse_position(&self, position: Point<Pixels>) -> bool {
+        unsafe {
+            let native_window = self.0.lock().native_window;
+            let content_height = self.content_size().height;
+            let window_point = NSPoint::new(
+                f64::from(position.x),
+                f64::from(content_height - position.y),
+            );
+            let screen_point: NSPoint =
+                msg_send![native_window, convertPointToScreen: window_point];
+            let main_display_height = core_graphics::display::CGDisplay::main()
+                .bounds()
+                .size
+                .height;
+            core_graphics::display::CGDisplay::warp_mouse_cursor_position(CGPoint::new(
+                screen_point.x,
+                main_display_height - screen_point.y,
+            ))
+            .is_ok()
+        }
+    }
+
     fn modifiers(&self) -> Modifiers {
         unsafe {
             let modifiers: NSEventModifierFlags = msg_send![class!(NSEvent), modifierFlags];

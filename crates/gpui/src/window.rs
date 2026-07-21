@@ -2493,6 +2493,18 @@ impl Window {
         self.mouse_position
     }
 
+    /// Moves the mouse cursor to a position relative to the window.
+    ///
+    /// Returns whether the current platform supports repositioning the cursor.
+    pub fn set_mouse_position(&mut self, position: Point<Pixels>) -> bool {
+        if self.platform_window.set_mouse_position(position) {
+            self.mouse_position = position;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
     /// events will be routed to listeners that check this hitbox's `is_hovered` status,
     /// regardless of actual hit testing. This enables drag operations that continue
