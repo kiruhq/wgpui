@@ -815,7 +815,11 @@ mod tests {
     const TEST_IMG_ID: &str = "test-img";
 
     fn test_image(frame_count: usize) -> Arc<RenderImage> {
-        let frame = Frame::new(ImageBuffer::from_pixel(1, 1, Rgba([0, 0, 0, 0])));
+        test_image_with_size(frame_count, 1, 1)
+    }
+
+    fn test_image_with_size(frame_count: usize, width: u32, height: u32) -> Arc<RenderImage> {
+        let frame = Frame::new(ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0])));
         Arc::new(RenderImage::new(SmallVec::from_iter(
             (0..frame_count).map(|_| frame.clone()),
         )))
@@ -863,5 +867,24 @@ mod tests {
                 .id(TEST_IMG_ID)
                 .into_any_element()
         });
+    }
+
+    #[gpui::test]
+    fn explicit_image_dimensions_are_not_replaced_by_source_aspect_ratio(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_empty_window();
+
+        let (_, hitbox) =
+            window.draw(point(px(0.), px(0.)), size(px(160.), px(90.)), |_, _| {
+                img(ImageSource::Render(test_image_with_size(1, 90, 160)))
+                    .id(TEST_IMG_ID)
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .on_click(|_, _, _| {})
+            });
+
+        let bounds = hitbox.expect("image hitbox").bounds;
+        assert_eq!(bounds.size, size(px(160.), px(90.)));
     }
 }
